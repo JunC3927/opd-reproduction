@@ -18,6 +18,7 @@ conda/
 # IDE and OS files
 .idea/
 .vscode/
+.github/
 .DS_Store
 Thumbs.db
 
