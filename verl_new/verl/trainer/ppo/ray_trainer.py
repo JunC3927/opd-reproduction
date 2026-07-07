@@ -135,22 +135,44 @@ def _dump_opd_metrics_jsonl(path: str, record: dict):
         f.write(json.dumps(_opd_trace_jsonable(record), ensure_ascii=False, sort_keys=True) + "\n")
 
 
-def _opd_trace_dump_path(path: str, dump_index: int, global_steps: int, total_dumps: int):
+def _opd_trace_dump_path(
+    path: str,
+    dump_index: int,
+    global_steps: int,
+    total_dumps: int,
+    chunk_index: int | None = None,
+):
     if total_dumps <= 1:
         return path
     stem, ext = os.path.splitext(path)
     if not ext:
         ext = ".pt"
+    if chunk_index is not None:
+        return f"{stem}_dump{dump_index:03d}_step{global_steps:06d}_chunk{chunk_index:02d}{ext}"
     return f"{stem}_dump{dump_index:03d}_step{global_steps:06d}{ext}"
 
 
 def _dump_opd_trace_batch(
-    path: str, batch: DataProto, global_steps: int, max_rows: int = 0, dump_index: int = 0, total_dumps: int = 1
+    path: str,
+    batch: DataProto,
+    global_steps: int,
+    max_rows: int = 0,
+    dump_index: int = 0,
+    total_dumps: int = 1,
+    chunk_index: int | None = None,
+    chunk_count: int = 1,
+    source_sample_count: int | None = None,
 ):
     if max_rows and len(batch) > max_rows:
         batch = batch[:max_rows]
 
-    dump_path = _opd_trace_dump_path(path, dump_index=dump_index, global_steps=global_steps, total_dumps=total_dumps)
+    dump_path = _opd_trace_dump_path(
+        path,
+        dump_index=dump_index,
+        global_steps=global_steps,
+        total_dumps=total_dumps,
+        chunk_index=chunk_index,
+    )
     payload = {
         "format": "verl_opd_trace_batch_v1",
         "trace_stage": "pre_actor_update",
@@ -159,6 +181,9 @@ def _dump_opd_trace_batch(
         "total_requested_dumps": total_dumps,
         "global_steps": global_steps,
         "sample_count": len(batch),
+        "chunk_index": chunk_index,
+        "chunk_count": chunk_count,
+        "source_sample_count": source_sample_count if source_sample_count is not None else len(batch),
         "batch": _opd_trace_to_cpu(batch.batch),
         "non_tensor_batch": _opd_trace_to_cpu(batch.non_tensor_batch),
         "meta_info": _opd_trace_to_cpu(batch.meta_info),
@@ -174,6 +199,7 @@ def _dump_opd_trace_batch(
         f"Saved OPD trace dump to {dump_path}; "
         f"dump_index={dump_index + 1}/{total_dumps}; global_steps={global_steps}; "
         f"sample_count={payload['sample_count']}; "
+        f"chunk_index={chunk_index}; chunk_count={chunk_count}; "
         f"batch_keys={payload['batch_keys']}; non_tensor_keys={payload['non_tensor_keys']}"
     )
 
@@ -1400,14 +1426,33 @@ class RayPPOTrainer:
         trace_dump_count = getattr(self, "_opd_trace_dump_count", 0)
         if trace_dump_path and trace_dump_count < trace_dump_num_updates:
             max_rows = int(os.getenv("VERL_OPD_TRACE_MAX_ROWS", "0") or "0")
-            _dump_opd_trace_batch(
-                trace_dump_path,
-                batch,
-                self.global_steps,
-                max_rows=max_rows,
-                dump_index=trace_dump_count,
-                total_dumps=trace_dump_num_updates,
-            )
+            chunk_size = int(os.getenv("VERL_OPD_TRACE_CHUNK_SIZE", "0") or "0")
+            if chunk_size > 0 and len(batch) > chunk_size:
+                source_sample_count = len(batch)
+                chunk_count = (source_sample_count + chunk_size - 1) // chunk_size
+                total_dump_files = trace_dump_num_updates * chunk_count
+                for chunk_index, start in enumerate(range(0, source_sample_count, chunk_size)):
+                    chunk_batch = batch[start : start + chunk_size]
+                    _dump_opd_trace_batch(
+                        trace_dump_path,
+                        chunk_batch,
+                        self.global_steps,
+                        max_rows=max_rows,
+                        dump_index=trace_dump_count * chunk_count + chunk_index,
+                        total_dumps=total_dump_files,
+                        chunk_index=chunk_index,
+                        chunk_count=chunk_count,
+                        source_sample_count=source_sample_count,
+                    )
+            else:
+                _dump_opd_trace_batch(
+                    trace_dump_path,
+                    batch,
+                    self.global_steps,
+                    max_rows=max_rows,
+                    dump_index=trace_dump_count,
+                    total_dumps=trace_dump_num_updates,
+                )
             self._opd_trace_dump_count = trace_dump_count + 1
         # update actor
         batch_td = batch.to_tensordict()
