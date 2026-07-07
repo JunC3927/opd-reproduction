@@ -1,0 +1,63 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Local environments
+.venv/
+venv/
+env/
+conda/
+
+# IDE and OS files
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+
+# Logs and run outputs
+*.log
+logs/
+outputs/
+output/
+runs/
+wandb/
+swanlab/
+experiments/
+checkpoints/
+ckpts/
+
+# OPD / verl trace dumps
+opd_trace*/
+verl_opd_trace*/
+trace_dumps/
+metrics_dumps/
+*.jsonl
+*.parquet.tmp
+
+# Model weights and large training artifacts
+*.pt
+*.pth
+*.bin
+*.safetensors
+*.ckpt
+*.onnx
+*.gguf
+*.npy
+*.npz
+
+# Ray / vLLM runtime files
+/tmp/
+ray_results/
+.ray/
+
+# Build artifacts
+build/
+dist/
+*.egg-info/

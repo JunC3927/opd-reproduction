@@ -1,0 +1,57 @@
+method:
+    name: lwf
+    lwf_alpha: 1.0
+    lwf_temperature: 2.0
+cl_sft:
+    stages:
+        - llava_v1_5_mix665k_textonly
+        - llava_v1_5_mix665k_coco
+        - llava_v1_5_mix665k_ocr_vqa
+        - llava_v1_5_mix665k_textvqa
+        - llava_v1_5_mix665k_gqa
+        - llava_v1_5_mix665k_vg
+data:
+    template: qwen3_vl
+    preprocessing_batch_size: 1000
+    preprocessing_num_workers: 16
+loader:
+    per_device_train_batch_size: 1
+model:
+    model_name_or_path: /ppio_net0/download/Qwen3-VL-2B-Instruct
+    local_files_only: true
+    torch_dtype: bfloat16
+    image_min_pixels: 1024
+    image_max_pixels: 262144
+optimizer:
+    learning_rate: 2.0e-5
+    weight_decay: 0
+    warmup_ratio: 0.03
+    warmup_steps: null
+tuning:
+    lora:
+        enable: true
+        r: 128
+        alpha: 256
+        dropout: 0.05
+        bias: "none"
+        task_type: CAUSAL_LM
+        target_modules: all
+    freeze_vision_tower: true
+    freeze_multi_modal_projector: true
+    prepare_model_for_kbit_training: false
+trainer:
+    save_dir: experiments/qwen3_vl/lora/cl_sft_mix665k_lwf_100
+    run_name: qwen3_vl_lora_cl_sft_mix665k_lwf_100
+    wandb_project: CL-debug
+    tf32: true
+    export_hf_model_at_end: true
+    merge_lora_before_export: true
+    enable_checkpointing: false
+    accelerator: auto
+    strategy: auto
+    devices: auto
+    precision: bf16-mixed
+    max_epochs: -1
+    max_steps: 100
+    accumulate_grad_batches: 4
+    gradient_clip_val: 1.0

@@ -1,0 +1,142 @@
+{
+  "demo2k": {
+    "load_from": "parquet",
+    "file_name_or_path": "/ppio_net0/datasets/parquet/llava779k_demo2k",
+    "formatting": "sharegpt",
+    "columns": {
+      "messages": "conversations",
+      "images": "image"
+    }
+  },
+  "demo10k": {
+    "load_from": "parquet",
+    "file_name_or_path": "/ppio_net0/datasets/parquet/llava779k_demo10k",
+    "formatting": "sharegpt",
+    "columns": {
+      "messages": "conversations",
+      "images": "image"
+    }
+  },
+  "llava779k": {
+    "load_from": "parquet",
+    "file_name_or_path": "/ppio_net0/datasets/parquet/llava779k_debug",
+    "formatting": "sharegpt",
+    "columns": {
+      "messages": "conversations",
+      "images": "image"
+    }
+  },
+  "llava_next_hf": {
+    "load_from": "hf_hub",
+    "file_name_or_path": "lmms-lab/LLaVA-NeXT-Data",
+    "split": "train",
+    "formatting": "sharegpt",
+    "columns": {
+      "messages": "conversations",
+      "images": "image"
+    }
+  },
+  "llava_v1_5_mix665k": {
+    "load_from": "json",
+    "file_name_or_path": "/ppio_net0/datasets/llava_v1_5_mix665k/json/llava_v1_5_mix665k_filtered.json",
+    "json_image_root": "/ppio_net0/datasets/llava_v1_5_mix665k/images",
+    "split": "train",
+    "formatting": "sharegpt",
+    "columns": {
+      "messages": "conversations",
+      "images": "image"
+    }
+  },
+  "llava_v1_5_mix665k_coco": {
+    "load_from": "json",
+    "file_name_or_path": "/ppio_net0/datasets/llava_v1_5_mix665k/json/task_incremental/coco.json",
+    "json_image_root": "/ppio_net0/datasets/llava_v1_5_mix665k/images",
+    "split": "train",
+    "formatting": "sharegpt",
+    "columns": {
+      "messages": "conversations",
+      "images": "image"
+    }
+  },
+  "llava_v1_5_mix665k_gqa": {
+    "load_from": "json",
+    "file_name_or_path": "/ppio_net0/datasets/llava_v1_5_mix665k/json/task_incremental/gqa.json",
+    "json_image_root": "/ppio_net0/datasets/llava_v1_5_mix665k/images",
+    "split": "train",
+    "formatting": "sharegpt",
+    "columns": {
+      "messages": "conversations",
+      "images": "image"
+    }
+  },
+  "llava_v1_5_mix665k_ocr_vqa": {
+    "load_from": "json",
+    "file_name_or_path": "/ppio_net0/datasets/llava_v1_5_mix665k/json/task_incremental/ocr_vqa.json",
+    "json_image_root": "/ppio_net0/datasets/llava_v1_5_mix665k/images",
+    "split": "train",
+    "formatting": "sharegpt",
+    "columns": {
+      "messages": "conversations",
+      "images": "image"
+    }
+  },
+  "llava_v1_5_mix665k_textvqa": {
+    "load_from": "json",
+    "file_name_or_path": "/ppio_net0/datasets/llava_v1_5_mix665k/json/task_incremental/textvqa.json",
+    "json_image_root": "/ppio_net0/datasets/llava_v1_5_mix665k/images",
+    "split": "train",
+    "formatting": "sharegpt",
+    "columns": {
+      "messages": "conversations",
+      "images": "image"
+    }
+  },
+  "llava_v1_5_mix665k_vg": {
+    "load_from": "json",
+    "file_name_or_path": "/ppio_net0/datasets/llava_v1_5_mix665k/json/task_incremental/vg.json",
+    "json_image_root": "/ppio_net0/datasets/llava_v1_5_mix665k/images",
+    "split": "train",
+    "formatting": "sharegpt",
+    "columns": {
+      "messages": "conversations",
+      "images": "image"
+    }
+  },
+  "llava_v1_5_mix665k_textonly": {
+    "load_from": "json",
+    "file_name_or_path": "/ppio_net0/datasets/llava_v1_5_mix665k/json/task_incremental/textonly.json",
+    "split": "train",
+    "formatting": "sharegpt",
+    "columns": {
+      "messages": "conversations",
+      "images": null
+    }
+  },
+  "llava779k_demo128_cj": {
+    "load_from": "parquet",
+    "file_name_or_path": "/raid/lwz/cj/LLaVA779K_demo128",
+    "formatting": "sharegpt",
+    "columns": {
+      "messages": "conversations",
+      "images": "image"
+    }
+  },
+  "geometry3k_cj": {
+    "load_from": "parquet",
+    "file_name_or_path": "/raid/lwz/cj/datasets/geometry3k_sharegpt",
+    "formatting": "sharegpt",
+    "columns": {
+      "messages": "conversations",
+      "images": "image"
+    }
+  },
+  "geometry3k_32_cj": {
+    "load_from": "parquet",
+    "file_name_or_path": "/raid/lwz/cj/datasets/geometry3k_sharegpt_32",
+    "formatting": "sharegpt",
+    "columns": {
+      "messages": "conversations",
+      "images": "image"
+    }
+  }
+}

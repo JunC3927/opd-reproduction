@@ -1,0 +1,91 @@
+cl_sft:
+    stages:
+        - geometry3k_cj
+
+data:
+    template: qwen3_vl
+    preprocessing_batch_size: 1000
+    preprocessing_num_workers: 16
+
+loader:
+    per_device_train_batch_size: 1
+
+model:
+    model_name_or_path: /raid/lwz/lzh/models/Qwen3-VL-2B-Instruct
+    local_files_only: true
+    torch_dtype: bfloat16
+    image_min_pixels: 1024
+    image_max_pixels: 262144
+
+optimizer:
+    # 对齐 verl: actor_lr=${ACTOR_LR:-1e-6}
+    learning_rate: 1.0e-6
+    weight_decay: 0
+    warmup_ratio: 0.03
+    warmup_steps: null
+
+method:
+    name: opd
+
+    # teacher: Qwen3-VL-8B-Instruct
+    opd_teacher_model_name_or_path: /raid/lwz/lzh/models/Qwen3-VL-8B-Instruct
+
+    # 对齐 verl: forward_kl_topk, topk=32
+    opd_alpha: 1.0
+    opd_temperature: 1.0
+    opd_loss_type: forward_kl_topk
+    opd_topk: 32
+
+    # 对齐 verl: 纯 OPD，不加 SFT loss
+    opd_sft_coef: 0.0
+
+    # 对齐 verl rollout
+    rollout_num_generations: 1
+    rollout_do_sample: true
+    rollout_temperature: 1.0
+    rollout_top_p: 1.0
+    rollout_top_k: null
+    rollout_max_new_tokens: 512
+
+tuning:
+    # 对齐 verl: student 全参数微调，不用 LoRA
+    lora:
+        enable: false
+        r: 128
+        alpha: 256
+        dropout: 0.05
+        bias: "none"
+        task_type: CAUSAL_LM
+        target_modules: all
+
+    freeze_vision_tower: false
+    freeze_multi_modal_projector: false
+    prepare_model_for_kbit_training: false
+
+trainer:
+    save_dir: experiments/qwen3_vl/opd_geometry3k_2b_teacher8b_full_topk32_lr1e6
+    run_name: qwen3_vl_opd_geometry3k_2b_teacher8b_full_topk32_lr1e6
+    wandb_project: CL-OPD
+
+    tf32: true
+
+    export_hf_model_at_end: true
+    merge_lora_before_export: false
+
+    enable_checkpointing: true
+
+    accelerator: auto
+    strategy: auto
+
+    devices: 8
+
+    precision: bf16-mixed
+
+    # 对齐 verl: 3 epoch
+    max_epochs: 3
+    max_steps: -1
+
+    # 对齐 verl: global batch = 1 × 4 × 6 = 24
+    accumulate_grad_batches: 3
+
+    gradient_clip_val: 1.0

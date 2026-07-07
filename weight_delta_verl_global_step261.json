@@ -1,0 +1,493 @@
+{
+  "base": "/raid/lwz/lzh/models/Qwen3-VL-2B-Instruct",
+  "tuned": "/raid/lwz/cj/verl/checkpoints/verl_distill_geo3k/qwen3_vl_2b_from_8b_geo3k_opd_full_e3_len512/global_step_261/hf_merged",
+  "common_tensor_count": 625,
+  "compared_tensor_count": 30,
+  "changed_tensor_count": 29,
+  "max_abs_diff_overall": 0.00048828125,
+  "max_relative_diff_norm_overall": 0.0020942013484178783,
+  "rows": [
+    {
+      "name": "model.language_model.embed_tokens.weight",
+      "shape": [
+        151936,
+        2048
+      ],
+      "base_dtype": "torch.float32",
+      "tuned_dtype": "torch.float32",
+      "max_abs_diff": 0.00048828125,
+      "mean_abs_diff": 4.4200633055879734e-06,
+      "diff_norm": 0.38877591490745544,
+      "base_norm": 541.9563598632812,
+      "relative_diff_norm": 0.0007173564952822613,
+      "nonzero_count": 20853242,
+      "numel": 311164928
+    },
+    {
+      "name": "model.visual.patch_embed.proj.weight",
+      "shape": [
+        1024,
+        3,
+        2,
+        16,
+        16
+      ],
+      "base_dtype": "torch.float32",
+      "tuned_dtype": "torch.float32",
+      "max_abs_diff": 0.0001220703125,
+      "mean_abs_diff": 1.1224315130675677e-05,
+      "diff_norm": 0.022062918171286583,
+      "base_norm": 10.535242080688477,
+      "relative_diff_norm": 0.0020942013484178783,
+      "nonzero_count": 858977,
+      "numel": 1572864
+    },
+    {
+      "name": "model.visual.merger.norm.weight",
+      "shape": [
+        1024
+      ],
+      "base_dtype": "torch.float32",
+      "tuned_dtype": "torch.float32",
+      "max_abs_diff": 0.0,
+      "mean_abs_diff": 0.0,
+      "diff_norm": 0.0,
+      "base_norm": 43.81089782714844,
+      "relative_diff_norm": 0.0,
+      "nonzero_count": 0,
+      "numel": 1024
+    },
+    {
+      "name": "model.language_model.layers.0.self_attn.q_proj.weight",
+      "shape": [
+        2048,
+        2048
+      ],
+      "base_dtype": "torch.float32",
+      "tuned_dtype": "torch.float32",
+      "max_abs_diff": 0.000244140625,
+      "mean_abs_diff": 9.36723608901957e-06,
+      "diff_norm": 0.04770376533269882,
+      "base_norm": 67.44444274902344,
+      "relative_diff_norm": 0.0007073046108515671,
+      "nonzero_count": 920944,
+      "numel": 4194304
+    },
+    {
+      "name": "model.language_model.layers.0.mlp.gate_proj.weight",
+      "shape": [
+        6144,
+        2048
+      ],
+      "base_dtype": "torch.float32",
+      "tuned_dtype": "torch.float32",
+      "max_abs_diff": 0.000244140625,
+      "mean_abs_diff": 8.449882443528622e-06,
+      "diff_norm": 0.07954763621091843,
+      "base_norm": 129.15277099609375,
+      "relative_diff_norm": 0.0006159189276188612,
+      "nonzero_count": 2452435,
+      "numel": 12582912
+    },
+    {
+      "name": "model.language_model.layers.12.self_attn.q_proj.weight",
+      "shape": [
+        2048,
+        2048
+      ],
+      "base_dtype": "torch.float32",
+      "tuned_dtype": "torch.float32",
+      "max_abs_diff": 0.000244140625,
+      "mean_abs_diff": 1.0485935490578413e-05,
+      "diff_norm": 0.05132346972823143,
+      "base_norm": 66.69444274902344,
+      "relative_diff_norm": 0.0007695314273989181,
+      "nonzero_count": 1000223,
+      "numel": 4194304
+    },
+    {
+      "name": "model.language_model.layers.24.self_attn.q_proj.weight",
+      "shape": [
+        2048,
+        2048
+      ],
+      "base_dtype": "torch.float32",
+      "tuned_dtype": "torch.float32",
+      "max_abs_diff": 0.000244140625,
+      "mean_abs_diff": 1.6805579434731044e-05,
+      "diff_norm": 0.07260167598724365,
+      "base_norm": 70.064697265625,
+      "relative_diff_norm": 0.001036209087038521,
+      "nonzero_count": 1286261,
+      "numel": 4194304
+    },
+    {
+      "name": "model.language_model.layers.1.mlp.gate_proj.weight",
+      "shape": [
+        6144,
+        2048
+      ],
+      "base_dtype": "torch.float32",
+      "tuned_dtype": "torch.float32",
+      "max_abs_diff": 0.000244140625,
+      "mean_abs_diff": 7.559643563581631e-06,
+      "diff_norm": 0.07343535125255585,
+      "base_norm": 150.4635467529297,
+      "relative_diff_norm": 0.0004880607485156599,
+      "nonzero_count": 2338152,
+      "numel": 12582912
+    },
+    {
+      "name": "model.language_model.layers.1.self_attn.q_proj.weight",
+      "shape": [
+        2048,
+        2048
+      ],
+      "base_dtype": "torch.float32",
+      "tuned_dtype": "torch.float32",
+      "max_abs_diff": 0.000244140625,
+      "mean_abs_diff": 8.92636217031395e-06,
+      "diff_norm": 0.04561968892812729,
+      "base_norm": 66.35076141357422,
+      "relative_diff_norm": 0.0006875533596935376,
+      "nonzero_count": 919740,
+      "numel": 4194304
+    },
+    {
+      "name": "model.language_model.layers.10.mlp.gate_proj.weight",
+      "shape": [
+        6144,
+        2048
+      ],
+      "base_dtype": "torch.float32",
+      "tuned_dtype": "torch.float32",
+      "max_abs_diff": 0.000244140625,
+      "mean_abs_diff": 1.1239645573368762e-05,
+      "diff_norm": 0.09625547379255295,
+      "base_norm": 126.265869140625,
+      "relative_diff_norm": 0.000762323773222922,
+      "nonzero_count": 2925019,
+      "numel": 12582912
+    },
+    {
+      "name": "model.language_model.layers.10.self_attn.q_proj.weight",
+      "shape": [
+        2048,
+        2048
+      ],
+      "base_dtype": "torch.float32",
+      "tuned_dtype": "torch.float32",
+      "max_abs_diff": 0.000244140625,
+      "mean_abs_diff": 1.0874104191316292e-05,
+      "diff_norm": 0.05285613611340523,
+      "base_norm": 65.52664184570312,
+      "relative_diff_norm": 0.0008066358144503516,
+      "nonzero_count": 1010573,
+      "numel": 4194304
+    },
+    {
+      "name": "model.language_model.layers.11.mlp.gate_proj.weight",
+      "shape": [
+        6144,
+        2048
+      ],
+      "base_dtype": "torch.float32",
+      "tuned_dtype": "torch.float32",
+      "max_abs_diff": 0.000244140625,
+      "mean_abs_diff": 1.1412382264097687e-05,
+      "diff_norm": 0.09698750078678131,
+      "base_norm": 119.79268646240234,
+      "relative_diff_norm": 0.000809627896751622,
+      "nonzero_count": 2973167,
+      "numel": 12582912
+    },
+    {
+      "name": "model.language_model.layers.11.self_attn.q_proj.weight",
+      "shape": [
+        2048,
+        2048
+      ],
+      "base_dtype": "torch.float32",
+      "tuned_dtype": "torch.float32",
+      "max_abs_diff": 0.000244140625,
+      "mean_abs_diff": 1.0324620234314352e-05,
+      "diff_norm": 0.05021214112639427,
+      "base_norm": 69.7776870727539,
+      "relative_diff_norm": 0.0007196016840460825,
+      "nonzero_count": 1022344,
+      "numel": 4194304
+    },
+    {
+      "name": "model.language_model.layers.12.mlp.gate_proj.weight",
+      "shape": [
+        6144,
+        2048
+      ],
+      "base_dtype": "torch.float32",
+      "tuned_dtype": "torch.float32",
+      "max_abs_diff": 0.000244140625,
+      "mean_abs_diff": 1.1789305972342845e-05,
+      "diff_norm": 0.09853371977806091,
+      "base_norm": 116.45868682861328,
+      "relative_diff_norm": 0.0008460830399287286,
+      "nonzero_count": 3070464,
+      "numel": 12582912
+    },
+    {
+      "name": "model.language_model.layers.13.mlp.gate_proj.weight",
+      "shape": [
+        6144,
+        2048
+      ],
+      "base_dtype": "torch.float32",
+      "tuned_dtype": "torch.float32",
+      "max_abs_diff": 0.000244140625,
+      "mean_abs_diff": 1.2207052350277081e-05,
+      "diff_norm": 0.10010448843240738,
+      "base_norm": 112.47383117675781,
+      "relative_diff_norm": 0.0008900247051697613,
+      "nonzero_count": 3188562,
+      "numel": 12582912
+    },
+    {
+      "name": "model.language_model.layers.13.self_attn.q_proj.weight",
+      "shape": [
+        2048,
+        2048
+      ],
+      "base_dtype": "torch.float32",
+      "tuned_dtype": "torch.float32",
+      "max_abs_diff": 0.000244140625,
+      "mean_abs_diff": 1.1148063094879035e-05,
+      "diff_norm": 0.05308184027671814,
+      "base_norm": 67.64098358154297,
+      "relative_diff_norm": 0.0007847585511929553,
+      "nonzero_count": 1053963,
+      "numel": 4194304
+    },
+    {
+      "name": "model.language_model.layers.14.mlp.gate_proj.weight",
+      "shape": [
+        6144,
+        2048
+      ],
+      "base_dtype": "torch.float32",
+      "tuned_dtype": "torch.float32",
+      "max_abs_diff": 0.000244140625,
+      "mean_abs_diff": 1.3041616512055043e-05,
+      "diff_norm": 0.10392475128173828,
+      "base_norm": 107.54793548583984,
+      "relative_diff_norm": 0.0009663109832119594,
+      "nonzero_count": 3371225,
+      "numel": 12582912
+    },
+    {
+      "name": "model.language_model.layers.14.self_attn.q_proj.weight",
+      "shape": [
+        2048,
+        2048
+      ],
+      "base_dtype": "torch.float32",
+      "tuned_dtype": "torch.float32",
+      "max_abs_diff": 0.000244140625,
+      "mean_abs_diff": 1.0488289262866601e-05,
+      "diff_norm": 0.05034112557768822,
+      "base_norm": 65.29515838623047,
+      "relative_diff_norm": 0.0007709779227414237,
+      "nonzero_count": 1043543,
+      "numel": 4194304
+    },
+    {
+      "name": "model.language_model.layers.15.mlp.gate_proj.weight",
+      "shape": [
+        6144,
+        2048
+      ],
+      "base_dtype": "torch.float32",
+      "tuned_dtype": "torch.float32",
+      "max_abs_diff": 0.000244140625,
+      "mean_abs_diff": 1.387780957884388e-05,
+      "diff_norm": 0.10884832590818405,
+      "base_norm": 108.27359771728516,
+      "relative_diff_norm": 0.001005308110222767,
+      "nonzero_count": 3473031,
+      "numel": 12582912
+    },
+    {
+      "name": "model.language_model.layers.15.self_attn.q_proj.weight",
+      "shape": [
+        2048,
+        2048
+      ],
+      "base_dtype": "torch.float32",
+      "tuned_dtype": "torch.float32",
+      "max_abs_diff": 0.000244140625,
+      "mean_abs_diff": 1.159982002718607e-05,
+      "diff_norm": 0.0543256513774395,
+      "base_norm": 66.70320129394531,
+      "relative_diff_norm": 0.0008144384425874724,
+      "nonzero_count": 1091301,
+      "numel": 4194304
+    },
+    {
+      "name": "model.language_model.layers.16.mlp.gate_proj.weight",
+      "shape": [
+        6144,
+        2048
+      ],
+      "base_dtype": "torch.float32",
+      "tuned_dtype": "torch.float32",
+      "max_abs_diff": 0.000244140625,
+      "mean_abs_diff": 1.5131881809793413e-05,
+      "diff_norm": 0.115514375269413,
+      "base_norm": 107.54149627685547,
+      "relative_diff_norm": 0.0010741376981777536,
+      "nonzero_count": 3659716,
+      "numel": 12582912
+    },
+    {
+      "name": "model.language_model.layers.16.self_attn.q_proj.weight",
+      "shape": [
+        2048,
+        2048
+      ],
+      "base_dtype": "torch.float32",
+      "tuned_dtype": "torch.float32",
+      "max_abs_diff": 0.000244140625,
+      "mean_abs_diff": 1.1730839105439372e-05,
+      "diff_norm": 0.05486090108752251,
+      "base_norm": 71.545654296875,
+      "relative_diff_norm": 0.0007667957142425454,
+      "nonzero_count": 1100057,
+      "numel": 4194304
+    },
+    {
+      "name": "model.language_model.layers.17.mlp.gate_proj.weight",
+      "shape": [
+        6144,
+        2048
+      ],
+      "base_dtype": "torch.float32",
+      "tuned_dtype": "torch.float32",
+      "max_abs_diff": 0.000244140625,
+      "mean_abs_diff": 1.652287937758956e-05,
+      "diff_norm": 0.12396620959043503,
+      "base_norm": 107.2242431640625,
+      "relative_diff_norm": 0.0011561397491121094,
+      "nonzero_count": 3775300,
+      "numel": 12582912
+    },
+    {
+      "name": "model.language_model.layers.17.self_attn.q_proj.weight",
+      "shape": [
+        2048,
+        2048
+      ],
+      "base_dtype": "torch.float32",
+      "tuned_dtype": "torch.float32",
+      "max_abs_diff": 0.000244140625,
+      "mean_abs_diff": 1.3220193068264052e-05,
+      "diff_norm": 0.0604301355779171,
+      "base_norm": 68.42439270019531,
+      "relative_diff_norm": 0.0008831665608300621,
+      "nonzero_count": 1146993,
+      "numel": 4194304
+    },
+    {
+      "name": "model.language_model.layers.18.mlp.gate_proj.weight",
+      "shape": [
+        6144,
+        2048
+      ],
+      "base_dtype": "torch.float32",
+      "tuned_dtype": "torch.float32",
+      "max_abs_diff": 0.000244140625,
+      "mean_abs_diff": 1.7755473891156726e-05,
+      "diff_norm": 0.1307782530784607,
+      "base_norm": 108.49726104736328,
+      "relative_diff_norm": 0.001205359949329697,
+      "nonzero_count": 3904541,
+      "numel": 12582912
+    },
+    {
+      "name": "model.language_model.layers.18.self_attn.q_proj.weight",
+      "shape": [
+        2048,
+        2048
+      ],
+      "base_dtype": "torch.float32",
+      "tuned_dtype": "torch.float32",
+      "max_abs_diff": 0.000244140625,
+      "mean_abs_diff": 1.4408638890017755e-05,
+      "diff_norm": 0.0645097941160202,
+      "base_norm": 70.44685363769531,
+      "relative_diff_norm": 0.0009157228575145583,
+      "nonzero_count": 1198440,
+      "numel": 4194304
+    },
+    {
+      "name": "model.language_model.layers.19.mlp.gate_proj.weight",
+      "shape": [
+        6144,
+        2048
+      ],
+      "base_dtype": "torch.float32",
+      "tuned_dtype": "torch.float32",
+      "max_abs_diff": 0.000244140625,
+      "mean_abs_diff": 1.8610151528264396e-05,
+      "diff_norm": 0.1356571465730667,
+      "base_norm": 109.95979309082031,
+      "relative_diff_norm": 0.0012336977249586302,
+      "nonzero_count": 3982713,
+      "numel": 12582912
+    },
+    {
+      "name": "model.language_model.layers.19.self_attn.q_proj.weight",
+      "shape": [
+        2048,
+        2048
+      ],
+      "base_dtype": "torch.float32",
+      "tuned_dtype": "torch.float32",
+      "max_abs_diff": 0.000244140625,
+      "mean_abs_diff": 1.611748848517891e-05,
+      "diff_norm": 0.06950850784778595,
+      "base_norm": 72.74124145507812,
+      "relative_diff_norm": 0.0009555584487887992,
+      "nonzero_count": 1282736,
+      "numel": 4194304
+    },
+    {
+      "name": "model.language_model.layers.2.mlp.gate_proj.weight",
+      "shape": [
+        6144,
+        2048
+      ],
+      "base_dtype": "torch.float32",
+      "tuned_dtype": "torch.float32",
+      "max_abs_diff": 0.000244140625,
+      "mean_abs_diff": 7.300965080503374e-06,
+      "diff_norm": 0.07473214715719223,
+      "base_norm": 155.13003540039062,
+      "relative_diff_norm": 0.00048173873592118093,
+      "nonzero_count": 2072677,
+      "numel": 12582912
+    },
+    {
+      "name": "model.language_model.layers.2.self_attn.q_proj.weight",
+      "shape": [
+        2048,
+        2048
+      ],
+      "base_dtype": "torch.float32",
+      "tuned_dtype": "torch.float32",
+      "max_abs_diff": 0.000244140625,
+      "mean_abs_diff": 8.36631988931913e-06,
+      "diff_norm": 0.04303712025284767,
+      "base_norm": 65.93343353271484,
+      "relative_diff_norm": 0.0006527359178328476,
+      "nonzero_count": 902392,
+      "numel": 4194304
+    }
+  ]
+}
