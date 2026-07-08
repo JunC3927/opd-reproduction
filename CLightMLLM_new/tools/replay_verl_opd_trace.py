@@ -3,6 +3,7 @@ import glob
 import json
 import os
 import sys
+from collections import Counter
 from contextlib import nullcontext
 from dataclasses import fields, replace
 from pathlib import Path
@@ -334,6 +335,39 @@ def trainable_parameter_summary(model: torch.nn.Module) -> tuple[int, int]:
     return trainable, total
 
 
+def named_dtype_counts(named_tensors: Any) -> dict[str, int]:
+    counter: Counter[str] = Counter()
+    for _name, tensor in named_tensors:
+        if tensor is None:
+            continue
+        counter[str(tensor.dtype)] += int(tensor.numel())
+    return dict(sorted(counter.items()))
+
+
+def model_param_dtype_counts(model: torch.nn.Module, trainable_only: bool = False) -> dict[str, int]:
+    tensors = (
+        (name, param)
+        for name, param in model.named_parameters()
+        if (param.requires_grad or not trainable_only)
+    )
+    return named_dtype_counts(tensors)
+
+
+def model_grad_dtype_counts(model: torch.nn.Module) -> dict[str, int]:
+    return named_dtype_counts((name, param.grad) for name, param in model.named_parameters())
+
+
+def optimizer_state_dtype_counts(optimizer: torch.optim.Optimizer | None) -> dict[str, int]:
+    if optimizer is None:
+        return {}
+    counter: Counter[str] = Counter()
+    for state in optimizer.state.values():
+        for value in state.values():
+            if torch.is_tensor(value):
+                counter[str(value.dtype)] += int(value.numel())
+    return dict(sorted(counter.items()))
+
+
 def init_swanlab(args: argparse.Namespace, config: dict[str, Any]) -> Any:
     if not args.swanlab_project:
         return None
@@ -449,6 +483,11 @@ def main() -> None:
     parser.add_argument("--swanlab-mode", default=None)
     parser.add_argument("--swanlab-logdir", default=None)
     parser.add_argument("--save-model-dir", default=None, help="Optional HF directory for the replay-updated student.")
+    parser.add_argument(
+        "--debug-dtypes",
+        action="store_true",
+        help="Print parameter, forward, grad, and optimizer-state dtypes for precision debugging.",
+    )
     args = parser.parse_args()
 
     os.chdir(ROOT)
@@ -498,6 +537,11 @@ def main() -> None:
     print(f"learning_rate={optimizer_args.learning_rate}")
     print(f"trainable_params={trainable} total_params={total}")
     print(f"student_vocab_size={vocab_size}")
+    if args.debug_dtypes:
+        print(f"[dtype] model_param_dtypes={model_param_dtype_counts(model)}", flush=True)
+        print(f"[dtype] trainable_param_dtypes={model_param_dtype_counts(model, trainable_only=True)}", flush=True)
+        if optimizer is not None:
+            print(f"[dtype] optimizer_defaults={optimizer.defaults}", flush=True)
 
     metrics_output = None
     if args.metrics_output:
@@ -608,6 +652,17 @@ def main() -> None:
                     outputs = model(**forward_kwargs)
                 sync_cuda(device, f"file {file_idx} rows {start}:{end} model forward")
                 shifted_logits = outputs.logits[:, :-1, :]
+                if args.debug_dtypes and file_idx == 0 and start == 0:
+                    debug_forward = {
+                        "input_ids": str(input_ids.dtype),
+                        "attention_mask": str(attention_mask.dtype),
+                        "response_mask": str(response_mask.dtype),
+                        "logits": str(outputs.logits.dtype),
+                    }
+                    for key, value in forward_kwargs.items():
+                        if torch.is_tensor(value):
+                            debug_forward[key] = str(value.dtype)
+                    print(f"[dtype] first_forward={debug_forward}", flush=True)
                 max_student_len = shifted_logits.shape[1] - response_start
                 max_teacher_len = teacher_ids_cpu.shape[1] - response_start
                 current_response_len = min(response_len, max_student_len, max_teacher_len)
@@ -646,6 +701,18 @@ def main() -> None:
                 loss_num = loss_outputs["loss_num"]
                 loss_num_total = loss_num if loss_num_total is None else loss_num_total + loss_num.detach()
                 micro_loss = loss_num / token_count_total
+                if args.debug_dtypes and file_idx == 0 and start == 0:
+                    debug_loss = {
+                        "student_logits": str(student_logits.dtype),
+                        "teacher_logps": str(teacher_logps.dtype),
+                        "teacher_ids": str(teacher_ids.dtype),
+                        "loss_num": str(loss_num.dtype),
+                        "micro_loss": str(micro_loss.dtype),
+                        "token_loss": str(loss_outputs["token_loss"].dtype),
+                        "student_mass": str(loss_outputs["student_mass"].dtype),
+                        "teacher_mass": str(loss_outputs["teacher_mass"].dtype),
+                    }
+                    print(f"[dtype] first_loss={debug_loss}", flush=True)
                 if args.train:
                     micro_loss.backward()
                     sync_cuda(device, f"file {file_idx} rows {start}:{end} backward")
@@ -664,10 +731,14 @@ def main() -> None:
             update_stats: dict[str, float] = {}
             if args.train:
                 grad_value = grad_norm(model).detach().cpu()
+                if args.debug_dtypes and file_idx == 0:
+                    print(f"[dtype] grad_dtypes_before_step={model_grad_dtype_counts(model)}", flush=True)
                 if args.grad_clip is not None and args.grad_clip > 0:
                     torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
                 assert optimizer is not None
                 optimizer.step()
+                if args.debug_dtypes and file_idx == 0:
+                    print(f"[dtype] optimizer_state_dtypes_after_step={optimizer_state_dtype_counts(optimizer)}", flush=True)
                 update_stats = compute_update_stats(model, probe_name, probe_idx, probe_before)
 
             denom = actual_token_count.clamp_min(1.0)
