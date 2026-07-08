@@ -674,9 +674,13 @@ def main() -> None:
             record = {
                 "format": "clight_verl_trace_replay_metrics_v1",
                 "file_index": file_idx,
+                "replay_update_step": file_idx + 1,
                 "path": path,
                 "dump_index": payload.get("dump_index"),
                 "global_step": payload.get("global_steps"),
+                "chunk_index": payload.get("chunk_index"),
+                "chunk_count": payload.get("chunk_count"),
+                "source_sample_count": payload.get("source_sample_count"),
                 "samples": batch_size,
                 "tokens": int(actual_token_count.item()),
                 "loss": float(loss_value.detach().cpu().item()),
@@ -719,7 +723,7 @@ def main() -> None:
                 metrics_output.write(json.dumps(record, ensure_ascii=False) + "\n")
                 metrics_output.flush()
             if swanlab_run is not None:
-                log_swanlab_metrics(record, int(record.get("global_step") or file_idx))
+                log_swanlab_metrics(record, int(record["replay_update_step"]))
         if args.save_model_dir:
             save_replay_model(
                 model,
