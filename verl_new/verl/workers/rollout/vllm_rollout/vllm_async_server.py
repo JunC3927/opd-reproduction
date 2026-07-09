@@ -493,6 +493,7 @@ class vLLMHttpServer:
         prompt_ids: list[int],
         sampling_params: dict[str, Any],
         request_id: str,
+        upstream_request_id: Optional[str] = None,
         image_data: Optional[list[Any]] = None,
         video_data: Optional[list[Any]] = None,
         audio_data: Optional[list[Any]] = None,
@@ -501,6 +502,7 @@ class vLLMHttpServer:
     ) -> TokenOutput:
         """Generate sequence with token-in-token-out."""
         prompt_ids = normalize_token_ids(prompt_ids)
+        original_prompt_ids = list(prompt_ids)
 
         # Calculate the maximum possible new tokens based on available context space
         # This serves as a safety upper bound. vLLM v0.20+ rejects `max_tokens < 1`
@@ -554,6 +556,8 @@ class vLLMHttpServer:
             prompt_kwargs["mm_processor_kwargs"] = mm_processor_kwargs
         self._maybe_dump_opd_vllm_prompt(
             request_id=request_id,
+            upstream_request_id=upstream_request_id,
+            original_prompt_ids=original_prompt_ids,
             prompt_kwargs=prompt_kwargs,
             sampling_params=sampling_params,
         )
@@ -654,6 +658,8 @@ class vLLMHttpServer:
         self,
         *,
         request_id: str,
+        upstream_request_id: Optional[str],
+        original_prompt_ids: list[int],
         prompt_kwargs: dict[str, Any],
         sampling_params: SamplingParams,
     ) -> None:
@@ -674,13 +680,18 @@ class vLLMHttpServer:
             "format": "verl_vllm_tokens_prompt_v1",
             "dump_index": dump_index,
             "request_id": request_id,
+            "vllm_request_id": request_id,
+            "upstream_request_id": upstream_request_id,
             "pid": os.getpid(),
             "replica_rank": self.replica_rank,
             "node_rank": self.node_rank,
             "global_steps": self.global_steps,
             "prompt_kwargs": _opd_vllm_prompt_to_cpu(prompt_kwargs),
+            "original_prompt_token_ids": [int(token_id) for token_id in original_prompt_ids],
+            "original_prompt_len": len(original_prompt_ids),
             "prompt_token_ids": [int(token_id) for token_id in prompt_token_ids],
             "prompt_len": len(prompt_token_ids),
+            "dedup_prompt_len_delta": len(original_prompt_ids) - len(prompt_token_ids),
             "sampling_params": _opd_sampling_params_to_dict(sampling_params),
             "image_count": len(multi_modal_data.get("image") or []),
             "video_count": len(multi_modal_data.get("video") or []),

@@ -210,6 +210,7 @@ class LLMServerClient:
                 multimodal_kwargs["mm_processor_kwargs"] = mm_processor_kwargs
             output: TokenOutput = await server.generate.remote(
                 request_id=uuid4().hex,  # use new request_id for each turn
+                upstream_request_id=request_id,
                 prompt_ids=prompt_ids,
                 sampling_params=sampling_params,
                 image_data=image_data,

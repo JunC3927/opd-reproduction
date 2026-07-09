@@ -70,8 +70,16 @@ def request_sequence(request: dict[str, Any]) -> list[int]:
     raise KeyError("Request dump has neither prompt_token_ids nor sequence_ids.")
 
 
+def request_row_match_sequence(request: dict[str, Any]) -> list[int]:
+    if "original_prompt_token_ids" in request:
+        return [int(token_id) for token_id in request["original_prompt_token_ids"]]
+    if "sequence_ids" in request:
+        return [int(token_id) for token_id in request["sequence_ids"]]
+    return request_sequence(request)
+
+
 def request_id(request: dict[str, Any]) -> str | None:
-    value = request.get("request_id")
+    value = request.get("upstream_request_id", request.get("request_id"))
     return str(value) if value is not None else None
 
 
@@ -206,7 +214,7 @@ def main() -> None:
             match_id = request_id(match_request)
             if match_id is None:
                 continue
-            match_seq = request_sequence(match_request)
+            match_seq = request_row_match_sequence(match_request)
             row = sequence_to_row.get(tuple(match_seq))
             if row is None:
                 raise RuntimeError(
@@ -219,7 +227,7 @@ def main() -> None:
             match_id = request_id(request)
             row = row_match_by_request_id.get(match_id) if match_id is not None else None
             if row is None:
-                row = sequence_to_row.get(tuple(seq))
+                row = sequence_to_row.get(tuple(request_row_match_sequence(request)))
             if row is None:
                 raise RuntimeError(
                     "Could not locate trace row for teacher input. If this is a final vLLM "
@@ -229,8 +237,8 @@ def main() -> None:
             request_rows.append(row)
         row_match_count = len(row_match_by_request_id)
     else:
-        for path, seq in zip(request_paths, request_sequences, strict=True):
-            row = sequence_to_row.get(tuple(seq))
+        for path, request in zip(request_paths, requests, strict=True):
+            row = sequence_to_row.get(tuple(request_row_match_sequence(request)))
             if row is None:
                 raise RuntimeError(
                     f"Teacher request does not exactly match any trace row: {path}. "
