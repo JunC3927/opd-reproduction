@@ -45,7 +45,8 @@ def first_active_index(attention_mask: torch.Tensor) -> int:
 
 
 def extract_images(request: dict[str, Any]) -> list[Any]:
-    mm_data = request.get("multi_modal_data") or {}
+    prompt_kwargs = request.get("prompt_kwargs") or {}
+    mm_data = prompt_kwargs.get("multi_modal_data") or request.get("multi_modal_data") or {}
     for key in ("images", "image"):
         value = mm_data.get(key)
         if value is None:
@@ -56,6 +57,33 @@ def extract_images(request: dict[str, Any]) -> list[Any]:
             return list(value)
         return [value]
     return []
+
+
+def request_sequence(request: dict[str, Any]) -> list[int]:
+    if "prompt_token_ids" in request:
+        return [int(token_id) for token_id in request["prompt_token_ids"]]
+    prompt_kwargs = request.get("prompt_kwargs") or {}
+    if "prompt_token_ids" in prompt_kwargs:
+        return [int(token_id) for token_id in prompt_kwargs["prompt_token_ids"]]
+    if "sequence_ids" in request:
+        return [int(token_id) for token_id in request["sequence_ids"]]
+    raise KeyError("Request dump has neither prompt_token_ids nor sequence_ids.")
+
+
+def request_multi_modal_data(request: dict[str, Any]) -> dict[str, Any] | None:
+    prompt_kwargs = request.get("prompt_kwargs") or {}
+    if "multi_modal_data" in prompt_kwargs:
+        return prompt_kwargs["multi_modal_data"]
+    if "multi_modal_data" in request:
+        return request["multi_modal_data"]
+    return None
+
+
+def request_mm_processor_kwargs(request: dict[str, Any]) -> dict[str, Any] | None:
+    prompt_kwargs = request.get("prompt_kwargs") or {}
+    if "mm_processor_kwargs" in prompt_kwargs:
+        return prompt_kwargs["mm_processor_kwargs"]
+    return request.get("mm_processor_kwargs")
 
 
 def pad_sequences(sequences: list[list[int]], pad_token_id: int) -> tuple[torch.Tensor, torch.Tensor]:
@@ -151,7 +179,7 @@ def main() -> None:
 
     request_paths = expand_paths(args.teacher_requests)
     requests = [load_pt(path) for path in request_paths]
-    request_sequences = [list(map(int, request["sequence_ids"])) for request in requests]
+    request_sequences = [request_sequence(request) for request in requests]
     request_rows = []
     for path, seq in zip(request_paths, request_sequences, strict=True):
         row = sequence_to_row.get(tuple(seq))
@@ -186,8 +214,8 @@ def main() -> None:
             row_batch = request_rows[start:end]
             input_batch, mask_batch = pad_sequences(seq_batch, args.pad_token_id)
             images_batch = [extract_images(request) for request in requests[start:end]]
-            multi_modal_data_batch = [request.get("multi_modal_data") for request in requests[start:end]]
-            kwargs_batch = [request.get("mm_processor_kwargs") for request in requests[start:end]]
+            multi_modal_data_batch = [request_multi_modal_data(request) for request in requests[start:end]]
+            kwargs_batch = [request_mm_processor_kwargs(request) for request in requests[start:end]]
             new_logps, new_ids = scorer.score(
                 sequences=input_batch,
                 attention_mask=mask_batch,

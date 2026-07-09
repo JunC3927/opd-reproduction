@@ -21,6 +21,7 @@ from pprint import pprint
 from typing import Any, Callable, Optional
 
 import ray
+import torch
 import vllm.entrypoints.cli.serve
 from packaging import version
 from ray.actor import ActorHandle
@@ -81,6 +82,34 @@ else:
 
 logger = logging.getLogger(__file__)
 logger.setLevel(logging.INFO)
+
+
+def _opd_vllm_prompt_to_cpu(value):
+    if torch.is_tensor(value):
+        return value.detach().cpu()
+    if isinstance(value, dict):
+        return {key: _opd_vllm_prompt_to_cpu(val) for key, val in value.items()}
+    if isinstance(value, tuple):
+        return tuple(_opd_vllm_prompt_to_cpu(val) for val in value)
+    if isinstance(value, list):
+        return [_opd_vllm_prompt_to_cpu(val) for val in value]
+    if hasattr(value, "items"):
+        try:
+            return {key: _opd_vllm_prompt_to_cpu(val) for key, val in value.items()}
+        except Exception:
+            return repr(value)
+    return value
+
+
+def _opd_sampling_params_to_dict(sampling_params: SamplingParams) -> dict[str, Any]:
+    return {
+        "max_tokens": getattr(sampling_params, "max_tokens", None),
+        "temperature": getattr(sampling_params, "temperature", None),
+        "prompt_logprobs": getattr(sampling_params, "prompt_logprobs", None),
+        "logprobs": getattr(sampling_params, "logprobs", None),
+        "repetition_penalty": getattr(sampling_params, "repetition_penalty", None),
+        "ignore_eos": getattr(sampling_params, "ignore_eos", None),
+    }
 
 
 class vLLMHttpServer:
@@ -145,6 +174,7 @@ class vLLMHttpServer:
         # used for http server
         self._server_address = ray.util.get_node_ip_address().strip("[]")
         self._server_port = None
+        self._opd_vllm_prompt_dump_count = 0
 
         # used for controlling vllm server profiler
         profiler_config = self.config.profiler
@@ -522,6 +552,11 @@ class vLLMHttpServer:
         prompt_kwargs = {"prompt_token_ids": prompt_ids, "multi_modal_data": multi_modal_data}
         if mm_processor_kwargs:
             prompt_kwargs["mm_processor_kwargs"] = mm_processor_kwargs
+        self._maybe_dump_opd_vllm_prompt(
+            request_id=request_id,
+            prompt_kwargs=prompt_kwargs,
+            sampling_params=sampling_params,
+        )
         try:
             prompt = TokensPrompt(**prompt_kwargs)
         except TypeError:
@@ -613,6 +648,53 @@ class vLLMHttpServer:
             stop_reason=stop_reason,
             num_preempted=num_preempted,
             extra_fields=extra_fields,
+        )
+
+    def _maybe_dump_opd_vllm_prompt(
+        self,
+        *,
+        request_id: str,
+        prompt_kwargs: dict[str, Any],
+        sampling_params: SamplingParams,
+    ) -> None:
+        dump_dir = os.getenv("VERL_OPD_VLLM_PROMPT_DUMP_DIR")
+        if not dump_dir:
+            return
+
+        limit = int(os.getenv("VERL_OPD_VLLM_PROMPT_DUMP_LIMIT", "0") or "0")
+        if limit <= 0 or self._opd_vllm_prompt_dump_count >= limit:
+            return
+
+        dump_index = self._opd_vllm_prompt_dump_count
+        self._opd_vllm_prompt_dump_count += 1
+        os.makedirs(dump_dir, exist_ok=True)
+        prompt_token_ids = prompt_kwargs.get("prompt_token_ids") or []
+        multi_modal_data = prompt_kwargs.get("multi_modal_data") or {}
+        payload = {
+            "format": "verl_vllm_tokens_prompt_v1",
+            "dump_index": dump_index,
+            "request_id": request_id,
+            "pid": os.getpid(),
+            "replica_rank": self.replica_rank,
+            "node_rank": self.node_rank,
+            "global_steps": self.global_steps,
+            "prompt_kwargs": _opd_vllm_prompt_to_cpu(prompt_kwargs),
+            "prompt_token_ids": [int(token_id) for token_id in prompt_token_ids],
+            "prompt_len": len(prompt_token_ids),
+            "sampling_params": _opd_sampling_params_to_dict(sampling_params),
+            "image_count": len(multi_modal_data.get("image") or []),
+            "video_count": len(multi_modal_data.get("video") or []),
+            "audio_count": len(multi_modal_data.get("audio") or []),
+            "has_mm_processor_kwargs": "mm_processor_kwargs" in prompt_kwargs,
+        }
+        dump_path = os.path.join(dump_dir, f"vllm_prompt_pid{os.getpid()}_idx{dump_index:05d}.pt")
+        torch.save(payload, dump_path)
+        print(
+            f"Saved VERL final vLLM prompt dump to {dump_path}; "
+            f"dump_index={dump_index}; prompt_len={payload['prompt_len']}; "
+            f"image_count={payload['image_count']}; "
+            f"prompt_logprobs={payload['sampling_params']['prompt_logprobs']}",
+            flush=True,
         )
 
     async def wake_up(self, tags: list[str] | None = None):
