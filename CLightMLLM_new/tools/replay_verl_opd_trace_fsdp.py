@@ -10,7 +10,13 @@ from typing import Any
 
 import torch
 import torch.distributed as dist
-from torch.distributed.fsdp import BackwardPrefetch, FullyShardedDataParallel as FSDP, ShardingStrategy
+from torch.distributed.fsdp import (
+    BackwardPrefetch,
+    FullStateDictConfig,
+    FullyShardedDataParallel as FSDP,
+    ShardingStrategy,
+    StateDictType,
+)
 from torch.distributed.fsdp.wrap import size_based_auto_wrap_policy
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -81,6 +87,35 @@ def reduce_sum(value: torch.Tensor) -> torch.Tensor:
     return value
 
 
+def save_fsdp_hf_model(model: FSDP, base_model: torch.nn.Module, processor: Any, output_dir: str) -> None:
+    save_path = Path(output_dir)
+    if is_rank0():
+        save_path.mkdir(parents=True, exist_ok=True)
+
+    dist.barrier()
+    state_cfg = FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
+    with FSDP.state_dict_type(model, StateDictType.FULL_STATE_DICT, state_cfg):
+        state_dict = model.state_dict()
+
+    if is_rank0():
+        base_model.eval()
+        base_model.save_pretrained(str(save_path), state_dict=state_dict, safe_serialization=True)
+        if processor is not None and hasattr(processor, "save_pretrained"):
+            processor.save_pretrained(str(save_path))
+        with (save_path / "clight_fsdp_replay_metadata.json").open("w", encoding="utf-8") as f:
+            json.dump(
+                {
+                    "format": "clight_verl_trace_replay_fsdp_model_v1",
+                    "world_size": int(os.environ.get("WORLD_SIZE", "1")),
+                },
+                f,
+                ensure_ascii=False,
+                indent=2,
+            )
+        print(f"saved_fsdp_replay_model={save_path}", flush=True)
+    dist.barrier()
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Replay verl OPD trace dumps with FSDP-sharded CLight student.")
     parser.add_argument("--config", required=True)
@@ -111,6 +146,7 @@ def main() -> None:
     parser.add_argument("--swanlab-workspace", default=None)
     parser.add_argument("--swanlab-mode", default=None)
     parser.add_argument("--swanlab-logdir", default=None)
+    parser.add_argument("--save-model-dir", default=None, help="Optional HF directory for the replay-updated student.")
     parser.add_argument("--debug-dtypes", action="store_true")
     parser.add_argument(
         "--fsdp-min-num-params",
@@ -469,6 +505,8 @@ def main() -> None:
                     log_swanlab_metrics(record, int(record["replay_update_step"]))
 
             dist.barrier()
+        if args.save_model_dir:
+            save_fsdp_hf_model(model, base_model, processor, args.save_model_dir)
     finally:
         if metrics_output is not None:
             metrics_output.close()
