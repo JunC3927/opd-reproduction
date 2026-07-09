@@ -131,6 +131,56 @@ def topk_set_overlap(old_ids: torch.Tensor, new_ids: torch.Tensor, mask: torch.T
     return float(sum(overlaps) / len(overlaps))
 
 
+def matched_logprob_stats(
+    old_logps: torch.Tensor,
+    old_ids: torch.Tensor,
+    new_logps: torch.Tensor,
+    new_ids: torch.Tensor,
+    mask: torch.Tensor,
+) -> dict[str, float]:
+    old_logps_cpu = old_logps.detach().cpu().float()
+    new_logps_cpu = new_logps.detach().cpu().float()
+    old_ids_cpu = old_ids.detach().cpu().long()
+    new_ids_cpu = new_ids.detach().cpu().long()
+    mask_cpu = mask.detach().cpu().bool()
+
+    matched = 0
+    total = 0
+    diffs = []
+    rank_deltas = []
+    for row in range(old_ids_cpu.shape[0]):
+        for pos in range(old_ids_cpu.shape[1]):
+            if not bool(mask_cpu[row, pos].item()):
+                continue
+            new_index = {
+                int(token_id.item()): (rank, float(new_logps_cpu[row, pos, rank].item()))
+                for rank, token_id in enumerate(new_ids_cpu[row, pos])
+            }
+            for old_rank, token_id in enumerate(old_ids_cpu[row, pos]):
+                total += 1
+                token = int(token_id.item())
+                if token not in new_index:
+                    continue
+                matched += 1
+                new_rank, new_logp = new_index[token]
+                diffs.append(abs(float(old_logps_cpu[row, pos, old_rank].item()) - new_logp))
+                rank_deltas.append(abs(old_rank - new_rank))
+
+    if total == 0:
+        return {
+            "matched_token_ratio": 0.0,
+            "matched_logps_mean_abs": 0.0,
+            "matched_logps_max_abs": 0.0,
+            "matched_rank_delta_mean": 0.0,
+        }
+    return {
+        "matched_token_ratio": float(matched / total),
+        "matched_logps_mean_abs": float(sum(diffs) / len(diffs)) if diffs else 0.0,
+        "matched_logps_max_abs": float(max(diffs)) if diffs else 0.0,
+        "matched_rank_delta_mean": float(sum(rank_deltas) / len(rank_deltas)) if rank_deltas else 0.0,
+    }
+
+
 def compare_slices(
     *,
     old_logps: torch.Tensor,
@@ -146,7 +196,7 @@ def compare_slices(
     old_mass = old_logps.float().exp().sum(dim=-1)
     new_mass = new_logps.float().exp().sum(dim=-1)
     denom = mask.float().sum().clamp_min(1.0)
-    return {
+    stats = {
         "active_tokens": float(mask.sum().item()),
         "ids_same": float(ids_equal[mask3].float().mean().item()) if mask3.any() else 0.0,
         "set_overlap": topk_set_overlap(old_ids, new_ids, mask),
@@ -155,6 +205,8 @@ def compare_slices(
         "old_mass": float((old_mass * mask.float()).sum().item() / denom.item()),
         "new_mass": float((new_mass * mask.float()).sum().item() / denom.item()),
     }
+    stats.update(matched_logprob_stats(old_logps, old_ids, new_logps, new_ids, mask))
+    return stats
 
 
 def scan_best_new_offset(
