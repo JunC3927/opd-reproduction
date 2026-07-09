@@ -186,6 +186,7 @@ def main() -> None:
             row_batch = request_rows[start:end]
             input_batch, mask_batch = pad_sequences(seq_batch, args.pad_token_id)
             images_batch = [extract_images(request) for request in requests[start:end]]
+            multi_modal_data_batch = [request.get("multi_modal_data") for request in requests[start:end]]
             kwargs_batch = [request.get("mm_processor_kwargs") for request in requests[start:end]]
             new_logps, new_ids = scorer.score(
                 sequences=input_batch,
@@ -195,6 +196,7 @@ def main() -> None:
                 video_token_id=args.video_token_id,
                 pad_token_id=args.pad_token_id,
                 mm_processor_kwargs_per_sample=kwargs_batch,
+                multi_modal_data_per_sample=multi_modal_data_batch,
             )
             new_logps = new_logps.cpu().float()
             new_ids = new_ids.cpu().long()

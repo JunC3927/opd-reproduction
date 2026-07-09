@@ -65,6 +65,7 @@ class RemoteTeacherScorer:
         pad_token_id: int,
         model_kwargs: dict[str, Any] | None = None,
         mm_processor_kwargs_per_sample: list[dict[str, Any] | None] | None = None,
+        multi_modal_data_per_sample: list[dict[str, Any] | None] | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         device = sequences.device
         cpu_model_kwargs = None
@@ -84,6 +85,7 @@ class RemoteTeacherScorer:
             "topk": self.topk,
             "model_kwargs": cpu_model_kwargs,
             "mm_processor_kwargs_per_sample": mm_processor_kwargs_per_sample,
+            "multi_modal_data_per_sample": multi_modal_data_per_sample,
         }
         response = rpc_call(self.host, self.port, request, self.timeout)
         if not isinstance(response, dict):

@@ -205,6 +205,7 @@ class VLLMTeacherScorer:
         image_token_id: int | None,
         video_token_id: int | None,
         mm_processor_kwargs: dict[str, Any] | None = None,
+        multi_modal_data: dict[str, Any] | None = None,
     ) -> tuple[Any, list[int]]:
         if self.dedup_mm_tokens:
             prompt_token_ids, kept_indices = self._dedup_consecutive_mm_tokens(
@@ -216,7 +217,22 @@ class VLLMTeacherScorer:
             prompt_token_ids = token_ids
             kept_indices = list(range(len(token_ids)))
         prompt_kwargs: dict[str, Any] = {"prompt_token_ids": prompt_token_ids}
-        if images:
+        if multi_modal_data is not None:
+            prompt_mm_data = {}
+            if "image" in multi_modal_data:
+                prompt_mm_data["image"] = multi_modal_data["image"]
+            elif "images" in multi_modal_data:
+                prompt_mm_data["image"] = multi_modal_data["images"]
+            if "video" in multi_modal_data:
+                prompt_mm_data["video"] = multi_modal_data["video"]
+            elif "videos" in multi_modal_data:
+                prompt_mm_data["video"] = multi_modal_data["videos"]
+            if "audio" in multi_modal_data:
+                prompt_mm_data["audio"] = multi_modal_data["audio"]
+            elif "audios" in multi_modal_data:
+                prompt_mm_data["audio"] = multi_modal_data["audios"]
+            prompt_kwargs["multi_modal_data"] = prompt_mm_data
+        elif images:
             prompt_kwargs["multi_modal_data"] = {"image": images}
         else:
             prompt_kwargs["multi_modal_data"] = {}
@@ -285,6 +301,7 @@ class VLLMTeacherScorer:
         pad_token_id: int,
         model_kwargs: dict[str, Any] | None = None,
         mm_processor_kwargs_per_sample: list[dict[str, Any] | None] | None = None,
+        multi_modal_data_per_sample: list[dict[str, Any] | None] | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         device = sequences.device
         batch_size, seq_len = sequences.shape
@@ -313,6 +330,14 @@ class VLLMTeacherScorer:
             mm_processor_kwargs_per_sample = list(mm_processor_kwargs_per_sample)
         if len(mm_processor_kwargs_per_sample) < batch_size:
             mm_processor_kwargs_per_sample.extend([None for _ in range(batch_size - len(mm_processor_kwargs_per_sample))])
+
+        if multi_modal_data_per_sample is None:
+            multi_modal_data_per_sample = [None for _ in range(batch_size)]
+        else:
+            multi_modal_data_per_sample = list(multi_modal_data_per_sample)
+        if len(multi_modal_data_per_sample) < batch_size:
+            multi_modal_data_per_sample.extend([None for _ in range(batch_size - len(multi_modal_data_per_sample))])
+
         for row_idx in range(batch_size):
             start = self._first_active_index(attention_mask[row_idx])
             token_ids = sequences[row_idx, start:].detach().cpu().tolist()
@@ -322,6 +347,7 @@ class VLLMTeacherScorer:
                 image_token_id=image_token_id,
                 video_token_id=video_token_id,
                 mm_processor_kwargs=mm_processor_kwargs_per_sample[row_idx],
+                multi_modal_data=multi_modal_data_per_sample[row_idx],
             )
             prompts.append(prompt)
             spans.append((row_idx, start, len(token_ids), kept_indices))

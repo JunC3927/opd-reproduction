@@ -51,6 +51,7 @@ class TeacherHandler(socketserver.BaseRequestHandler):
                     video_token_id=request.get("video_token_id"),
                     pad_token_id=request["pad_token_id"],
                     mm_processor_kwargs_per_sample=request.get("mm_processor_kwargs_per_sample"),
+                    multi_modal_data_per_sample=request.get("multi_modal_data_per_sample"),
                 )
             send_message(
                 self.request,
