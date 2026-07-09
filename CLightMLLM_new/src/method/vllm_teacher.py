@@ -80,6 +80,7 @@ class VLLMTeacherScorer:
         except ImportError as exc:
             raise ImportError("method.opd_teacher_backend='vllm' requires the vllm package.") from exc
         self._tokens_prompt_cls = self._load_tokens_prompt_cls()
+        self._sampling_params_cls = SamplingParams
 
         if device is not None and device.startswith("cuda") and torch.cuda.is_available():
             previous_device = torch.cuda.current_device()
@@ -148,6 +149,7 @@ class VLLMTeacherScorer:
             temperature=1.0,
             prompt_logprobs=topk,
         )
+        self._sampling_params_keys = self._accepted_sampling_params_keys(SamplingParams)
 
     @staticmethod
     def _filter_llm_kwargs(llm_cls: Any, kwargs: dict[str, Any]) -> dict[str, Any]:
@@ -175,6 +177,31 @@ class VLLMTeacherScorer:
             return TokensPrompt
         except Exception:
             return None
+
+    @staticmethod
+    def _accepted_sampling_params_keys(sampling_params_cls: Any) -> set[str] | None:
+        try:
+            signature = inspect.signature(sampling_params_cls.__init__)
+        except (TypeError, ValueError):
+            return None
+        parameters = signature.parameters
+        if any(parameter.kind == parameter.VAR_KEYWORD for parameter in parameters.values()):
+            return None
+        return {key for key in parameters if key != "self"}
+
+    def _sampling_params_from_request(self, request: dict[str, Any]):
+        params = {
+            "max_tokens": 1,
+            "temperature": 1.0,
+            "prompt_logprobs": self.topk,
+        }
+        request_params = request.get("sampling_params")
+        if isinstance(request_params, dict):
+            params.update({key: value for key, value in request_params.items() if value is not None})
+        params.setdefault("prompt_logprobs", self.topk)
+        if self._sampling_params_keys is not None:
+            params = {key: value for key, value in params.items() if key in self._sampling_params_keys}
+        return self._sampling_params_cls(**params)
 
     @staticmethod
     def _dedup_consecutive_mm_tokens(
@@ -318,7 +345,8 @@ class VLLMTeacherScorer:
         pad_token_id: int,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         prompts = [self._request_to_prompt(request) for request in requests]
-        outputs = self.llm.generate(prompts, self.sampling_params, use_tqdm=False)
+        sampling_params = [self._sampling_params_from_request(request) for request in requests]
+        outputs = self.llm.generate(prompts, sampling_params, use_tqdm=False)
         if len(outputs) != len(requests):
             raise RuntimeError(f"vLLM returned {len(outputs)} outputs for {len(requests)} prompts.")
 
