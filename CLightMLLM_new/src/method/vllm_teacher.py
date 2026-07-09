@@ -49,8 +49,10 @@ class VLLMTeacherScorer:
         local_files_only: bool = False,
         image_min_pixels: int | None = None,
         image_max_pixels: int | None = None,
+        dedup_mm_tokens: bool = True,
     ) -> None:
         self.topk = topk
+        self.dedup_mm_tokens = bool(dedup_mm_tokens)
         device = resolve_cuda_device(device)
         self.device = device
         self.visible_devices = visible_devices
@@ -204,11 +206,15 @@ class VLLMTeacherScorer:
         video_token_id: int | None,
         mm_processor_kwargs: dict[str, Any] | None = None,
     ) -> tuple[Any, list[int]]:
-        prompt_token_ids, kept_indices = self._dedup_consecutive_mm_tokens(
-            token_ids,
-            image_token_id,
-            video_token_id,
-        )
+        if self.dedup_mm_tokens:
+            prompt_token_ids, kept_indices = self._dedup_consecutive_mm_tokens(
+                token_ids,
+                image_token_id,
+                video_token_id,
+            )
+        else:
+            prompt_token_ids = token_ids
+            kept_indices = list(range(len(token_ids)))
         prompt_kwargs: dict[str, Any] = {"prompt_token_ids": prompt_token_ids}
         if images:
             prompt_kwargs["multi_modal_data"] = {"image": images}

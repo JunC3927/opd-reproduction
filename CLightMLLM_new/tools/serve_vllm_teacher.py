@@ -92,6 +92,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--device", default=None)
     parser.add_argument("--image-min-pixels", type=int, default=None)
     parser.add_argument("--image-max-pixels", type=int, default=None)
+    parser.add_argument("--dedup-mm-tokens", action=argparse.BooleanOptionalAction, default=True)
     parser.set_defaults(
         enable_chunked_prefill=None,
         enable_prefix_caching=None,
@@ -117,6 +118,7 @@ def main() -> None:
         f"logprobs_mode={args.logprobs_mode}",
         f"image_min_pixels={args.image_min_pixels}",
         f"image_max_pixels={args.image_max_pixels}",
+        f"dedup_mm_tokens={args.dedup_mm_tokens}",
         f"CUDA_VISIBLE_DEVICES={os.environ.get('CUDA_VISIBLE_DEVICES')}",
         flush=True,
     )
@@ -146,6 +148,7 @@ def main() -> None:
         local_files_only=args.local_files_only,
         image_min_pixels=args.image_min_pixels,
         image_max_pixels=args.image_max_pixels,
+        dedup_mm_tokens=args.dedup_mm_tokens,
     )
     state = TeacherState(scorer)
     with TeacherTCPServer((args.host, args.port), TeacherHandler, state) as server:
