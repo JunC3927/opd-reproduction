@@ -157,6 +157,73 @@ def compare_slices(
     }
 
 
+def scan_best_new_offset(
+    *,
+    old_logps: torch.Tensor,
+    old_ids: torch.Tensor,
+    new_logps: torch.Tensor,
+    new_ids: torch.Tensor,
+    old_start: int,
+    new_start: int,
+    response_mask: torch.Tensor,
+    max_response_len: int,
+    radius: int,
+) -> dict[str, float]:
+    best: dict[str, float] | None = None
+    for delta in range(-radius, radius + 1):
+        candidate_new_start = new_start + delta
+        if candidate_new_start < 0:
+            continue
+        response_len = min(
+            max_response_len,
+            old_logps.shape[0] - old_start,
+            new_logps.shape[0] - candidate_new_start,
+        )
+        if response_len <= 0:
+            continue
+        stats = compare_slices(
+            old_logps=old_logps[old_start : old_start + response_len, :].unsqueeze(0),
+            old_ids=old_ids[old_start : old_start + response_len, :].unsqueeze(0),
+            new_logps=new_logps[candidate_new_start : candidate_new_start + response_len, :].unsqueeze(0),
+            new_ids=new_ids[candidate_new_start : candidate_new_start + response_len, :].unsqueeze(0),
+            mask=response_mask[:response_len].unsqueeze(0),
+        )
+        stats["delta"] = float(delta)
+        stats["new_start"] = float(candidate_new_start)
+        stats["response_len"] = float(response_len)
+        if best is None:
+            best = stats
+            continue
+        current_key = (
+            stats["ids_same"],
+            stats["set_overlap"],
+            -stats["logps_mean_abs"],
+            -stats["logps_max_abs"],
+        )
+        best_key = (
+            best["ids_same"],
+            best["set_overlap"],
+            -best["logps_mean_abs"],
+            -best["logps_max_abs"],
+        )
+        if current_key > best_key:
+            best = stats
+    if best is None:
+        return {
+            "delta": 0.0,
+            "new_start": float(new_start),
+            "response_len": 0.0,
+            "ids_same": 0.0,
+            "set_overlap": 0.0,
+            "logps_mean_abs": 0.0,
+            "logps_max_abs": 0.0,
+            "old_mass": 0.0,
+            "new_mass": 0.0,
+            "active_tokens": 0.0,
+        }
+    return best
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Re-score dumped VERL teacher vLLM requests and compare against trace teacher tensors."
@@ -184,6 +251,15 @@ def main() -> None:
     parser.add_argument("--video-token-id", type=int, default=151656)
     parser.add_argument("--pad-token-id", type=int, default=151643)
     parser.add_argument("--metrics-output", default=None)
+    parser.add_argument(
+        "--response-offset-scan-radius",
+        type=int,
+        default=0,
+        help=(
+            "Diagnostic only. Try shifting the new vLLM prompt_logprobs response slice "
+            "by +/- this many tokens and report the best offset."
+        ),
+    )
     args = parser.parse_args()
 
     trace = load_trace(args.trace)
@@ -274,6 +350,7 @@ def main() -> None:
         all_new_resp_logps = []
         all_new_resp_ids = []
         all_resp_masks = []
+        all_best_offsets = []
 
         for start in range(0, len(requests), args.micro_batch_size):
             end = min(start + args.micro_batch_size, len(requests))
@@ -340,6 +417,20 @@ def main() -> None:
                     new_ids=new_resp_ids.unsqueeze(0),
                     mask=resp_mask.unsqueeze(0),
                 )
+                offset_scan = None
+                if args.response_offset_scan_radius > 0:
+                    offset_scan = scan_best_new_offset(
+                        old_logps=old_logps[row],
+                        old_ids=old_ids[row],
+                        new_logps=new_logps[local_idx],
+                        new_ids=new_ids[local_idx],
+                        old_start=response_start,
+                        new_start=active_response_start,
+                        response_mask=response_mask[row],
+                        max_response_len=int(response_mask.shape[1]),
+                        radius=int(args.response_offset_scan_radius),
+                    )
+                    all_best_offsets.append(offset_scan["delta"])
 
                 record = {
                     "request_index": start + local_idx,
@@ -351,26 +442,33 @@ def main() -> None:
                     "active": active_stats,
                     "response": resp_stats,
                 }
+                if offset_scan is not None:
+                    record["response_offset_scan"] = offset_scan
                 if metrics_file is not None:
                     metrics_file.write(json.dumps(record, ensure_ascii=False) + "\n")
                     metrics_file.flush()
-                print(
-                    " | ".join(
+                parts = [
+                    f"request={record['request_index']}",
+                    f"trace_row={row}",
+                    f"seq_len={seq_len}",
+                    f"images={record['image_count']}",
+                    f"resp_ids_same={resp_stats['ids_same']:.6f}",
+                    f"resp_set_overlap={resp_stats['set_overlap']:.6f}",
+                    f"resp_logps_mean_abs={resp_stats['logps_mean_abs']:.6e}",
+                    f"resp_logps_max_abs={resp_stats['logps_max_abs']:.6e}",
+                    f"resp_old_mass={resp_stats['old_mass']:.8f}",
+                    f"resp_new_mass={resp_stats['new_mass']:.8f}",
+                ]
+                if offset_scan is not None:
+                    parts.extend(
                         [
-                            f"request={record['request_index']}",
-                            f"trace_row={row}",
-                            f"seq_len={seq_len}",
-                            f"images={record['image_count']}",
-                            f"resp_ids_same={resp_stats['ids_same']:.6f}",
-                            f"resp_set_overlap={resp_stats['set_overlap']:.6f}",
-                            f"resp_logps_mean_abs={resp_stats['logps_mean_abs']:.6e}",
-                            f"resp_logps_max_abs={resp_stats['logps_max_abs']:.6e}",
-                            f"resp_old_mass={resp_stats['old_mass']:.8f}",
-                            f"resp_new_mass={resp_stats['new_mass']:.8f}",
+                            f"best_new_delta={int(offset_scan['delta'])}",
+                            f"best_resp_ids_same={offset_scan['ids_same']:.6f}",
+                            f"best_resp_set_overlap={offset_scan['set_overlap']:.6f}",
+                            f"best_resp_logps_mean_abs={offset_scan['logps_mean_abs']:.6e}",
                         ]
-                    ),
-                    flush=True,
-                )
+                    )
+                print(" | ".join(parts), flush=True)
 
                 all_old_active_logps.append(old_active_logps)
                 all_old_active_ids.append(old_active_ids)
@@ -399,6 +497,12 @@ def main() -> None:
         )
         print(f"active_summary={json.dumps(active_summary, sort_keys=True)}", flush=True)
         print(f"response_summary={json.dumps(response_summary, sort_keys=True)}", flush=True)
+        if all_best_offsets:
+            offset_counts: dict[str, int] = {}
+            for offset in all_best_offsets:
+                key = str(int(offset))
+                offset_counts[key] = offset_counts.get(key, 0) + 1
+            print(f"response_offset_scan_counts={json.dumps(offset_counts, sort_keys=True)}", flush=True)
     finally:
         if metrics_file is not None:
             metrics_file.close()
