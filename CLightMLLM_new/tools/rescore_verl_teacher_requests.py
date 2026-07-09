@@ -203,7 +203,11 @@ def main() -> None:
 
     request_paths = expand_paths(args.teacher_requests)
     requests = [load_pt(path) for path in request_paths]
-    request_sequences = [request_sequence(request) for request in requests]
+    direct_prompt_mode = all("prompt_kwargs" in request for request in requests)
+    request_sequences = [
+        request_row_match_sequence(request) if direct_prompt_mode else request_sequence(request)
+        for request in requests
+    ]
     request_rows = []
     row_match_count = 0
     if args.row_match_requests:
@@ -254,6 +258,7 @@ def main() -> None:
     print(f"request_count={len(requests)}", flush=True)
     if args.row_match_requests:
         print(f"row_match_request_count={row_match_count}", flush=True)
+    print(f"direct_prompt_mode={direct_prompt_mode}", flush=True)
     print(f"teacher={args.host}:{args.port}", flush=True)
     print(f"request_rows={request_rows}", flush=True)
 
@@ -274,27 +279,35 @@ def main() -> None:
             end = min(start + args.micro_batch_size, len(requests))
             seq_batch = request_sequences[start:end]
             row_batch = request_rows[start:end]
-            input_batch, mask_batch = pad_sequences(seq_batch, args.pad_token_id)
             images_batch = [extract_images(request) for request in requests[start:end]]
-            multi_modal_data_batch = [request_multi_modal_data(request) for request in requests[start:end]]
             kwargs_batch = [request_mm_processor_kwargs(request) for request in requests[start:end]]
-            new_logps, new_ids = scorer.score(
-                sequences=input_batch,
-                attention_mask=mask_batch,
-                images_per_sample=images_batch,
-                image_token_id=args.image_token_id,
-                video_token_id=args.video_token_id,
-                pad_token_id=args.pad_token_id,
-                mm_processor_kwargs_per_sample=kwargs_batch,
-                multi_modal_data_per_sample=multi_modal_data_batch,
-            )
+            if direct_prompt_mode:
+                new_logps, new_ids, new_lengths = scorer.score_prompt_requests(
+                    requests=requests[start:end],
+                    pad_token_id=args.pad_token_id,
+                )
+            else:
+                input_batch, mask_batch = pad_sequences(seq_batch, args.pad_token_id)
+                multi_modal_data_batch = [request_multi_modal_data(request) for request in requests[start:end]]
+                new_logps, new_ids = scorer.score(
+                    sequences=input_batch,
+                    attention_mask=mask_batch,
+                    images_per_sample=images_batch,
+                    image_token_id=args.image_token_id,
+                    video_token_id=args.video_token_id,
+                    pad_token_id=args.pad_token_id,
+                    mm_processor_kwargs_per_sample=kwargs_batch,
+                    multi_modal_data_per_sample=multi_modal_data_batch,
+                )
+                new_lengths = torch.tensor([max(len(seq) - 1, 0) for seq in seq_batch], dtype=torch.long)
             new_logps = new_logps.cpu().float()
             new_ids = new_ids.cpu().long()
+            new_lengths = new_lengths.cpu().long()
 
             for local_idx, row in enumerate(row_batch):
                 seq_len = len(seq_batch[local_idx])
                 trace_start = trace_starts[row]
-                active_len = max(seq_len - 1, 0)
+                active_len = min(max(seq_len - 1, 0), int(new_lengths[local_idx].item()))
                 old_active_logps = old_logps[row, trace_start : trace_start + active_len, :]
                 old_active_ids = old_ids[row, trace_start : trace_start + active_len, :]
                 new_active_logps = new_logps[local_idx, :active_len, :]

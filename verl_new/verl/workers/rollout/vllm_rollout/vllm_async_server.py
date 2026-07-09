@@ -175,6 +175,7 @@ class vLLMHttpServer:
         self._server_address = ray.util.get_node_ip_address().strip("[]")
         self._server_port = None
         self._opd_vllm_prompt_dump_count = 0
+        self._opd_teacher_io_dump_count = 0
 
         # used for controlling vllm server profiler
         profiler_config = self.config.profiler
@@ -613,6 +614,16 @@ class vLLMHttpServer:
         if sampling_params.logprobs is not None:
             log_probs = [logprobs[token_ids[i]].logprob for i, logprobs in enumerate(final_res.outputs[0].logprobs)]
 
+        self._maybe_dump_opd_teacher_io(
+            request_id=request_id,
+            upstream_request_id=upstream_request_id,
+            original_prompt_ids=original_prompt_ids,
+            prompt_kwargs=prompt_kwargs,
+            sampling_params=sampling_params,
+            generated_token_ids=token_ids,
+            extra_fields=extra_fields,
+        )
+
         routed_experts = None
         if self.config.enable_rollout_routing_replay:
             routed_experts = final_res.outputs[0].routed_experts
@@ -705,6 +716,72 @@ class vLLMHttpServer:
             f"dump_index={dump_index}; prompt_len={payload['prompt_len']}; "
             f"image_count={payload['image_count']}; "
             f"prompt_logprobs={payload['sampling_params']['prompt_logprobs']}",
+            flush=True,
+        )
+
+    def _maybe_dump_opd_teacher_io(
+        self,
+        *,
+        request_id: str,
+        upstream_request_id: Optional[str],
+        original_prompt_ids: list[int],
+        prompt_kwargs: dict[str, Any],
+        sampling_params: SamplingParams,
+        generated_token_ids: list[int],
+        extra_fields: dict[str, Any],
+    ) -> None:
+        dump_dir = os.getenv("VERL_OPD_TEACHER_IO_DUMP_DIR")
+        if not dump_dir:
+            return
+
+        prompt_logprobs_k = getattr(sampling_params, "prompt_logprobs", None)
+        if prompt_logprobs_k is None:
+            return
+
+        limit = int(os.getenv("VERL_OPD_TEACHER_IO_DUMP_LIMIT", "0") or "0")
+        if limit <= 0 or self._opd_teacher_io_dump_count >= limit:
+            return
+
+        dump_index = self._opd_teacher_io_dump_count
+        self._opd_teacher_io_dump_count += 1
+        os.makedirs(dump_dir, exist_ok=True)
+        prompt_token_ids = prompt_kwargs.get("prompt_token_ids") or []
+        multi_modal_data = prompt_kwargs.get("multi_modal_data") or {}
+        payload = {
+            "format": "verl_teacher_vllm_io_v1",
+            "dump_index": dump_index,
+            "request_id": request_id,
+            "vllm_request_id": request_id,
+            "upstream_request_id": upstream_request_id,
+            "pid": os.getpid(),
+            "replica_rank": self.replica_rank,
+            "node_rank": self.node_rank,
+            "global_steps": self.global_steps,
+            "input": {
+                "prompt_kwargs": _opd_vllm_prompt_to_cpu(prompt_kwargs),
+                "original_prompt_token_ids": [int(token_id) for token_id in original_prompt_ids],
+                "original_prompt_len": len(original_prompt_ids),
+                "prompt_token_ids": [int(token_id) for token_id in prompt_token_ids],
+                "prompt_len": len(prompt_token_ids),
+                "dedup_prompt_len_delta": len(original_prompt_ids) - len(prompt_token_ids),
+                "sampling_params": _opd_sampling_params_to_dict(sampling_params),
+                "image_count": len(multi_modal_data.get("image") or []),
+                "video_count": len(multi_modal_data.get("video") or []),
+                "audio_count": len(multi_modal_data.get("audio") or []),
+                "has_mm_processor_kwargs": "mm_processor_kwargs" in prompt_kwargs,
+            },
+            "output": {
+                "prompt_ids": _opd_vllm_prompt_to_cpu(extra_fields.get("prompt_ids")),
+                "prompt_logprobs": _opd_vllm_prompt_to_cpu(extra_fields.get("prompt_logprobs")),
+                "generated_token_ids": [int(token_id) for token_id in generated_token_ids],
+            },
+        }
+        dump_path = os.path.join(dump_dir, f"teacher_io_pid{os.getpid()}_idx{dump_index:05d}.pt")
+        torch.save(payload, dump_path)
+        print(
+            f"Saved VERL teacher vLLM IO dump to {dump_path}; "
+            f"dump_index={dump_index}; prompt_len={payload['input']['prompt_len']}; "
+            f"topk={prompt_logprobs_k}",
             flush=True,
         )
 

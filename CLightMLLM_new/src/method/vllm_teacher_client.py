@@ -97,5 +97,33 @@ class RemoteTeacherScorer:
         ids = response["teacher_topk_ids"].to(device=device, dtype=torch.long)
         return logps, ids
 
+    @torch.no_grad()
+    def score_prompt_requests(
+        self,
+        *,
+        requests: list[dict[str, Any]],
+        pad_token_id: int,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        response = rpc_call(
+            self.host,
+            self.port,
+            {
+                "op": "score_prompt_requests",
+                "requests": requests,
+                "pad_token_id": int(pad_token_id),
+                "topk": self.topk,
+            },
+            self.timeout,
+        )
+        if not isinstance(response, dict):
+            raise RuntimeError(f"Unexpected teacher server response type: {type(response)}")
+        if response.get("ok") is not True:
+            raise RuntimeError(response.get("error") or "Remote teacher scoring failed.")
+
+        logps = response["teacher_topk_logps"].to(dtype=torch.float32)
+        ids = response["teacher_topk_ids"].to(dtype=torch.long)
+        lengths = response["teacher_lengths"].to(dtype=torch.long)
+        return logps, ids, lengths
+
 
 RemoteVLLMTeacherScorer = RemoteTeacherScorer

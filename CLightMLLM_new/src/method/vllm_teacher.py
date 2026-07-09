@@ -289,6 +289,65 @@ class VLLMTeacherScorer:
             torch.tensor(ids_rows, dtype=torch.long),
         )
 
+    def _request_to_prompt(self, request: dict[str, Any]) -> Any:
+        prompt_kwargs = request.get("prompt_kwargs") or {}
+        if not prompt_kwargs:
+            if "prompt_token_ids" in request:
+                prompt_kwargs = {"prompt_token_ids": request["prompt_token_ids"]}
+            else:
+                raise KeyError("Final prompt request has neither prompt_kwargs nor prompt_token_ids.")
+            multi_modal_data = request.get("multi_modal_data")
+            if multi_modal_data is not None:
+                prompt_kwargs["multi_modal_data"] = multi_modal_data
+            mm_processor_kwargs = request.get("mm_processor_kwargs")
+            if mm_processor_kwargs is not None:
+                prompt_kwargs["mm_processor_kwargs"] = mm_processor_kwargs
+
+        if self._tokens_prompt_cls is not None:
+            try:
+                return self._tokens_prompt_cls(**prompt_kwargs)
+            except TypeError:
+                pass
+        return prompt_kwargs
+
+    @torch.no_grad()
+    def score_prompt_requests(
+        self,
+        *,
+        requests: list[dict[str, Any]],
+        pad_token_id: int,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        prompts = [self._request_to_prompt(request) for request in requests]
+        outputs = self.llm.generate(prompts, self.sampling_params, use_tqdm=False)
+        if len(outputs) != len(requests):
+            raise RuntimeError(f"vLLM returned {len(outputs)} outputs for {len(requests)} prompts.")
+
+        logps_rows = []
+        ids_rows = []
+        lengths = []
+        for output in outputs:
+            prompt_logprobs = getattr(output, "prompt_logprobs", None)
+            if prompt_logprobs is None:
+                raise RuntimeError("vLLM output did not include prompt_logprobs.")
+            output_len = len(prompt_logprobs) - 1
+            logps, ids = self._extract_topk(output, expected_len=output_len)
+            logps_rows.append(logps)
+            ids_rows.append(ids)
+            lengths.append(output_len)
+
+        max_len = max(lengths, default=0)
+        full_logps = torch.zeros(len(requests), max_len, self.topk, dtype=torch.float32)
+        full_ids = torch.full(
+            (len(requests), max_len, self.topk),
+            fill_value=int(pad_token_id),
+            dtype=torch.long,
+        )
+        for row, (logps, ids, length) in enumerate(zip(logps_rows, ids_rows, lengths, strict=True)):
+            if length > 0:
+                full_logps[row, :length] = logps
+                full_ids[row, :length] = ids
+        return full_logps, full_ids, torch.tensor(lengths, dtype=torch.long)
+
     @torch.no_grad()
     def score(
         self,

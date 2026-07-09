@@ -36,13 +36,29 @@ class TeacherHandler(socketserver.BaseRequestHandler):
             if op == "ping":
                 send_message(self.request, {"ok": True, "message": "pong"})
                 return
-            if op != "score":
+            if op not in ("score", "score_prompt_requests"):
                 send_message(self.request, {"ok": False, "error": f"Unsupported op: {op!r}"})
                 return
 
             server = self.server
             assert isinstance(server, TeacherTCPServer)
             with server.state.lock:
+                if op == "score_prompt_requests":
+                    logps, ids, lengths = server.state.scorer.score_prompt_requests(
+                        requests=request["requests"],
+                        pad_token_id=request["pad_token_id"],
+                    )
+                    send_message(
+                        self.request,
+                        {
+                            "ok": True,
+                            "teacher_topk_logps": logps.cpu(),
+                            "teacher_topk_ids": ids.cpu(),
+                            "teacher_lengths": lengths.cpu(),
+                        },
+                    )
+                    return
+
                 logps, ids = server.state.scorer.score(
                     sequences=request["sequences"],
                     attention_mask=request["attention_mask"],
@@ -53,14 +69,14 @@ class TeacherHandler(socketserver.BaseRequestHandler):
                     mm_processor_kwargs_per_sample=request.get("mm_processor_kwargs_per_sample"),
                     multi_modal_data_per_sample=request.get("multi_modal_data_per_sample"),
                 )
-            send_message(
-                self.request,
-                {
-                    "ok": True,
-                    "teacher_topk_logps": logps.cpu(),
-                    "teacher_topk_ids": ids.cpu(),
-                },
-            )
+                send_message(
+                    self.request,
+                    {
+                        "ok": True,
+                        "teacher_topk_logps": logps.cpu(),
+                        "teacher_topk_ids": ids.cpu(),
+                    },
+                )
         except Exception:
             send_message(self.request, {"ok": False, "error": traceback.format_exc()})
 
