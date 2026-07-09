@@ -61,6 +61,32 @@ def mismatch_window(left: list[int], right: list[int], center: int, radius: int 
     }
 
 
+def best_match(
+    teacher_seq: list[int],
+    trace_sequences: list[list[int]],
+    trace_dedup_sequences: list[list[int]],
+) -> dict[str, Any]:
+    exact_rows = [row for row, trace_seq in enumerate(trace_sequences) if trace_seq == teacher_seq]
+    dedup_rows = [row for row, trace_seq in enumerate(trace_dedup_sequences) if trace_seq == teacher_seq]
+    best_row = -1
+    best_prefix = -1
+    best_len_delta = 0
+    for row, trace_seq in enumerate(trace_sequences):
+        prefix = common_prefix_len(trace_seq, teacher_seq)
+        len_delta = abs(len(trace_seq) - len(teacher_seq))
+        if prefix > best_prefix or (prefix == best_prefix and len_delta < best_len_delta):
+            best_row = row
+            best_prefix = prefix
+            best_len_delta = len_delta
+    return {
+        "exact_rows": exact_rows,
+        "dedup_rows": dedup_rows,
+        "best_row": best_row,
+        "best_prefix": best_prefix,
+        "best_len_delta": best_len_delta,
+    }
+
+
 def expand_paths(patterns: list[str]) -> list[str]:
     paths: list[str] = []
     for pattern in patterns:
@@ -106,6 +132,34 @@ def main() -> None:
     print(f"trace_rows={row_count}")
     print(f"teacher_request_count={len(request_sequences)}")
     print(f"image_token_id={args.image_token_id} video_token_id={args.video_token_id}")
+
+    print("\n[all-to-all request -> trace row matches]")
+    exact_count = 0
+    dedup_count = 0
+    for request_idx, teacher_seq in enumerate(request_sequences):
+        match = best_match(teacher_seq, trace_sequences, trace_dedup_sequences)
+        exact_rows = match["exact_rows"]
+        dedup_rows = match["dedup_rows"]
+        exact_count += int(bool(exact_rows))
+        dedup_count += int(bool(dedup_rows))
+        print(
+            " | ".join(
+                [
+                    f"request={request_idx}",
+                    f"teacher_file={Path(request_paths[request_idx]).name}",
+                    f"teacher_len={len(teacher_seq)}",
+                    f"exact_rows={exact_rows}",
+                    f"dedup_rows={dedup_rows}",
+                    f"best_row={match['best_row']}",
+                    f"best_prefix={match['best_prefix']}",
+                    f"best_len_delta={match['best_len_delta']}",
+                    f"teacher_image_tokens={count_token(teacher_seq, args.image_token_id)}",
+                ]
+            )
+        )
+    print(f"all_to_all_exact_request_count={exact_count}/{len(request_sequences)}")
+    print(f"all_to_all_dedup_request_count={dedup_count}/{len(request_sequences)}")
+    print("\n[index-aligned row -> request comparison]")
 
     for row, trace_seq in enumerate(trace_sequences):
         if row >= len(request_sequences):
