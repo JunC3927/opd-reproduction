@@ -70,6 +70,11 @@ def request_sequence(request: dict[str, Any]) -> list[int]:
     raise KeyError("Request dump has neither prompt_token_ids nor sequence_ids.")
 
 
+def request_id(request: dict[str, Any]) -> str | None:
+    value = request.get("request_id")
+    return str(value) if value is not None else None
+
+
 def request_multi_modal_data(request: dict[str, Any]) -> dict[str, Any] | None:
     prompt_kwargs = request.get("prompt_kwargs") or {}
     if "multi_modal_data" in prompt_kwargs:
@@ -150,6 +155,17 @@ def main() -> None:
     )
     parser.add_argument("--trace", required=True)
     parser.add_argument("--teacher-requests", nargs="+", required=True)
+    parser.add_argument(
+        "--row-match-requests",
+        nargs="*",
+        default=None,
+        help=(
+            "Optional VERL teacher_manager request dumps. When --teacher-requests "
+            "are final vLLM TokensPrompt dumps, use matching request_id values from "
+            "these manager dumps to locate the corresponding trace rows. The final "
+            "vLLM prompt is still used as the actual teacher input."
+        ),
+    )
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=29577)
     parser.add_argument("--timeout", type=float, default=1800.0)
@@ -181,17 +197,55 @@ def main() -> None:
     requests = [load_pt(path) for path in request_paths]
     request_sequences = [request_sequence(request) for request in requests]
     request_rows = []
-    for path, seq in zip(request_paths, request_sequences, strict=True):
-        row = sequence_to_row.get(tuple(seq))
-        if row is None:
-            raise RuntimeError(f"Teacher request does not exactly match any trace row: {path}")
-        request_rows.append(row)
+    row_match_count = 0
+    if args.row_match_requests:
+        row_match_paths = expand_paths(args.row_match_requests)
+        row_match_by_request_id: dict[str, int] = {}
+        for path in row_match_paths:
+            match_request = load_pt(path)
+            match_id = request_id(match_request)
+            if match_id is None:
+                continue
+            match_seq = request_sequence(match_request)
+            row = sequence_to_row.get(tuple(match_seq))
+            if row is None:
+                raise RuntimeError(
+                    "Row-match teacher_manager request does not exactly match any trace row: "
+                    f"{path}"
+                )
+            row_match_by_request_id[match_id] = row
+
+        for path, request, seq in zip(request_paths, requests, request_sequences, strict=True):
+            match_id = request_id(request)
+            row = row_match_by_request_id.get(match_id) if match_id is not None else None
+            if row is None:
+                row = sequence_to_row.get(tuple(seq))
+            if row is None:
+                raise RuntimeError(
+                    "Could not locate trace row for teacher input. If this is a final vLLM "
+                    "prompt dump, pass the matching teacher_manager dumps via "
+                    f"--row-match-requests. path={path} request_id={match_id}"
+                )
+            request_rows.append(row)
+        row_match_count = len(row_match_by_request_id)
+    else:
+        for path, seq in zip(request_paths, request_sequences, strict=True):
+            row = sequence_to_row.get(tuple(seq))
+            if row is None:
+                raise RuntimeError(
+                    f"Teacher request does not exactly match any trace row: {path}. "
+                    "If this is a final vLLM prompt dump, also pass "
+                    "--row-match-requests /path/to/teacher_requests/*.pt"
+                )
+            request_rows.append(row)
 
     scorer = RemoteTeacherScorer(host=args.host, port=args.port, timeout=args.timeout, topk=args.topk)
 
     print("=== rescore VERL teacher request dumps ===", flush=True)
     print(f"trace={args.trace}", flush=True)
     print(f"request_count={len(requests)}", flush=True)
+    if args.row_match_requests:
+        print(f"row_match_request_count={row_match_count}", flush=True)
     print(f"teacher={args.host}:{args.port}", flush=True)
     print(f"request_rows={request_rows}", flush=True)
 
