@@ -66,8 +66,9 @@ def pad_sequences(sequences: list[list[int]], pad_token_id: int) -> tuple[torch.
     attention_mask = torch.zeros((len(sequences), max_len), dtype=torch.long)
     for row, seq in enumerate(sequences):
         length = len(seq)
-        input_ids[row, :length] = torch.tensor(seq, dtype=torch.long)
-        attention_mask[row, :length] = 1
+        start = max_len - length
+        input_ids[row, start:] = torch.tensor(seq, dtype=torch.long)
+        attention_mask[row, start:] = 1
     return input_ids, attention_mask
 
 
