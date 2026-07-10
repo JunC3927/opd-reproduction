@@ -4,6 +4,7 @@ import os
 import sys
 from contextlib import nullcontext
 from dataclasses import replace
+from datetime import timedelta
 from functools import partial
 from pathlib import Path
 from typing import Any
@@ -56,7 +57,7 @@ def rank_print(*args: Any, **kwargs: Any) -> None:
         print(*args, **kwargs)
 
 
-def init_distributed() -> tuple[int, int, int, torch.device]:
+def init_distributed(timeout_sec: int | None = None) -> tuple[int, int, int, torch.device]:
     if not torch.cuda.is_available():
         raise RuntimeError("FSDP replay requires CUDA.")
 
@@ -64,7 +65,9 @@ def init_distributed() -> tuple[int, int, int, torch.device]:
     world_size = int(os.environ["WORLD_SIZE"])
     local_rank = int(os.environ.get("LOCAL_RANK", "0"))
     torch.cuda.set_device(local_rank)
-    dist.init_process_group(backend="nccl")
+    if timeout_sec is None:
+        timeout_sec = int(os.environ.get("CLIGHT_DIST_TIMEOUT_SEC", "600"))
+    dist.init_process_group(backend="nccl", timeout=timedelta(seconds=int(timeout_sec)))
     device = torch.device("cuda", local_rank)
     return rank, world_size, local_rank, device
 

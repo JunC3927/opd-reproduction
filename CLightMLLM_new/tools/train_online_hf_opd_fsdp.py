@@ -658,6 +658,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--teacher-host", default="127.0.0.1")
     parser.add_argument("--teacher-port", type=int, default=29577)
     parser.add_argument("--teacher-timeout", type=float, default=1800.0)
+    parser.add_argument("--dist-timeout-sec", type=int, default=1800)
     parser.add_argument("--topk", type=int, default=32)
     parser.add_argument("--epochs", type=int, default=1)
     parser.add_argument("--max-updates", type=int, default=0)
@@ -722,7 +723,7 @@ def main() -> None:
     os.chdir(ROOT)
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
-    rank, world_size, local_rank, device = init_distributed()
+    rank, world_size, local_rank, device = init_distributed(timeout_sec=args.dist_timeout_sec)
 
     if args.samples_per_update % world_size != 0:
         raise ValueError(
@@ -784,6 +785,7 @@ def main() -> None:
     )
     student_rollout = None
     if args.rollout_backend in {"vllm_single", "vllm_ipc"} and is_rank0():
+        rank_print("student_vllm_init_start=True")
         os.environ.setdefault("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
         if model_args.model_name_or_path is None:
             raise ValueError(f"rollout_backend={args.rollout_backend} requires model.model_name_or_path in the config.")
@@ -803,6 +805,10 @@ def main() -> None:
             seed=0,
             limit_mm_per_prompt={"image": 1, "video": 0},
         )
+        rank_print("student_vllm_init_done=True")
+    if args.rollout_backend == "vllm_ipc":
+        dist.barrier()
+        rank_print("student_vllm_init_barrier_done=True")
 
     rank_print("=== online hf opd fsdp ===")
     rank_print(f"config={args.config}")
