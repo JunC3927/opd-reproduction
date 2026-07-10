@@ -13,8 +13,11 @@ tensor or the full HF state_dict to the live vLLM model.
 from __future__ import annotations
 
 import argparse
+import functools
+import inspect
 import os
 import sys
+from collections import deque
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -26,19 +29,117 @@ for path in (ROOT, TOOLS):
     if str(path) not in sys.path:
         sys.path.insert(0, str(path))
 
-from probe_vllm_update_weight import (  # noqa: E402
-    _apply_model_load_weights,
-    find_load_weights_target,
-    interesting_attrs,
-    safe_getattr,
-)
-
 
 AUTO_MODEL_CLASSES = (
     "AutoModelForImageTextToText",
     "AutoModelForVision2Seq",
     "AutoModelForCausalLM",
 )
+
+
+def safe_getattr(obj: Any, name: str) -> Any:
+    try:
+        return getattr(obj, name)
+    except Exception:
+        return None
+
+
+def get_path(root: Any, path: str) -> Any:
+    current = root
+    for attr in path.split("."):
+        current = safe_getattr(current, attr)
+        if current is None:
+            return None
+    return current
+
+
+def interesting_attrs(obj: Any) -> list[str]:
+    terms = ("weight", "load", "model", "worker", "engine", "executor", "rpc", "collective")
+    try:
+        names = dir(obj)
+    except Exception:
+        return []
+    return [name for name in names if any(term in name.lower() for term in terms)]
+
+
+def find_load_weights_target(llm: Any, max_depth: int) -> tuple[Any | None, str | None]:
+    explicit_paths = [
+        "llm_engine.model_executor.driver_worker.model_runner.model",
+        "llm_engine.model_executor.driver_worker.worker.model_runner.model",
+        "llm_engine.engine_core.engine_core.model_executor.driver_worker.model_runner.model",
+        "engine_core.engine_core.model_executor.driver_worker.model_runner.model",
+        "llm_engine.engine_core.model_executor.driver_worker.model_runner.model",
+        "llm_engine.engine_core.engine_core.model_executor.driver_worker.worker.model_runner.model",
+    ]
+    for path in explicit_paths:
+        target = get_path(llm, path)
+        if target is not None and callable(safe_getattr(target, "load_weights")):
+            return target, path
+
+    seen: set[int] = set()
+    queue: deque[tuple[Any, str, int]] = deque([(llm, "llm", 0)])
+    while queue:
+        obj, path, depth = queue.popleft()
+        obj_id = id(obj)
+        if obj_id in seen:
+            continue
+        seen.add(obj_id)
+
+        if callable(safe_getattr(obj, "load_weights")):
+            return obj, path
+        if depth >= max_depth:
+            continue
+
+        try:
+            names = dir(obj)
+        except Exception:
+            continue
+        for name in names:
+            if name.startswith("__"):
+                continue
+            if name.startswith("_") and name not in {"_model_executor", "_engine_core"}:
+                continue
+            if not any(term in name.lower() for term in ("model", "worker", "engine", "executor", "runner", "core")):
+                continue
+            child = safe_getattr(obj, name)
+            if child is None or isinstance(child, (str, bytes, int, float, bool, tuple, list, dict, Path)):
+                continue
+            queue.append((child, f"{path}.{name}", depth + 1))
+
+    return None, None
+
+
+def _load_weights_on_worker(model: Any, weights: list[tuple[str, torch.Tensor]]) -> str:
+    result = model.load_weights(weights)
+    return repr(result)
+
+
+def _apply_model_load_weights(owner: Any, owner_name: str, weights: list[tuple[str, torch.Tensor]]) -> tuple[bool, Any]:
+    apply_model = safe_getattr(owner, "apply_model")
+    if not callable(apply_model):
+        print(f"{owner_name}.apply_model = MISSING", flush=True)
+        return False, None
+
+    try:
+        print(f"{owner_name}.apply_model signature =", inspect.signature(apply_model), flush=True)
+    except Exception as exc:
+        print(f"{owner_name}.apply_model signature = <unavailable: {type(exc).__name__}: {exc}>", flush=True)
+
+    attempts = [
+        ("partial_func_only", lambda: apply_model(functools.partial(_load_weights_on_worker, weights=weights))),
+        ("func_plus_weights_positional", lambda: apply_model(_load_weights_on_worker, weights)),
+        ("func_plus_args_tuple", lambda: apply_model(_load_weights_on_worker, args=(weights,))),
+        ("func_plus_kwargs", lambda: apply_model(_load_weights_on_worker, kwargs={"weights": weights})),
+    ]
+    for attempt_name, attempt in attempts:
+        try:
+            print(f"trying {owner_name}.apply_model attempt={attempt_name}", flush=True)
+            result = attempt()
+            print(f"{owner_name}.apply_model attempt={attempt_name} return =", repr(result), flush=True)
+            return True, result
+        except Exception as exc:
+            print(f"{owner_name}.apply_model attempt={attempt_name} failed: {type(exc).__name__}: {exc}", flush=True)
+    return False, None
 
 
 def parse_args() -> argparse.Namespace:
