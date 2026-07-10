@@ -796,6 +796,8 @@ def main() -> None:
     if args.rollout_backend in {"vllm_single", "vllm_ipc"} and is_rank0():
         rank_print("student_vllm_init_start=True")
         os.environ.setdefault("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
+        os.environ.setdefault("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
+        rank_print(f"student_vllm_enable_v1_multiprocessing={os.environ.get('VLLM_ENABLE_V1_MULTIPROCESSING')}")
         if model_args.model_name_or_path is None:
             raise ValueError(f"rollout_backend={args.rollout_backend} requires model.model_name_or_path in the config.")
         student_rollout = VLLMStudentRollout(
