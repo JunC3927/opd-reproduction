@@ -13,10 +13,14 @@ tensor or the full HF state_dict to the live vLLM model.
 from __future__ import annotations
 
 import argparse
+import asyncio
 import functools
 import inspect
 import os
 import sys
+import threading
+import time
+import uuid
 from collections import deque
 from pathlib import Path
 from typing import Any, Iterable
@@ -25,7 +29,9 @@ import torch
 
 ROOT = Path(__file__).resolve().parents[1]
 TOOLS = Path(__file__).resolve().parent
-for path in (ROOT, TOOLS):
+REPO_ROOT = ROOT.parent
+VERL_ROOT = REPO_ROOT / "verl_new"
+for path in (ROOT, TOOLS, VERL_ROOT):
     if str(path) not in sys.path:
         sys.path.insert(0, str(path))
 
@@ -109,7 +115,7 @@ def find_load_weights_target(llm: Any, max_depth: int) -> tuple[Any | None, str 
     return None, None
 
 
-def _load_weights_on_worker(model: Any, weights: list[tuple[str, torch.Tensor]]) -> str:
+def load_weights_into_model(model: Any, weights: list[tuple[str, torch.Tensor]]) -> dict[str, Any]:
     named_buffers = dict(model.named_buffers())
     param_updates = []
     buffer_updates = []
@@ -130,12 +136,59 @@ def _load_weights_on_worker(model: Any, weights: list[tuple[str, torch.Tensor]])
         target.copy_(tensor.to(device=target.device, dtype=target.dtype), non_blocking=False)
         loaded_buffers += 1
 
+    return {
+        "load_weights": result,
+        "param_updates": len(param_updates),
+        "buffer_updates": len(buffer_updates),
+        "loaded_buffers": loaded_buffers,
+    }
+
+
+def _load_weights_on_worker(model: Any, weights: list[tuple[str, torch.Tensor]]) -> str:
+    return repr(load_weights_into_model(model, weights))
+
+
+def infer_model_device(model: torch.nn.Module) -> torch.device:
+    for tensor in list(model.parameters()) + list(model.buffers()):
+        return tensor.device
+    if torch.cuda.is_available():
+        return torch.device("cuda", torch.cuda.current_device())
+    return torch.device("cpu")
+
+
+def _ipc_load_weights_on_worker(model: Any, zmq_handle: str, use_shm: bool) -> str:
+    from verl.workers.rollout.vllm_rollout.bucketed_weight_transfer import BucketedWeightReceiver
+
+    device = infer_model_device(model)
+    bucket_summaries: list[dict[str, Any]] = []
+    receiver = BucketedWeightReceiver(
+        zmq_handle=zmq_handle,
+        device=device,
+        use_shm=use_shm,
+    )
+
+    def on_bucket_received(weights: list[tuple[str, torch.Tensor]]) -> None:
+        summary = load_weights_into_model(model, weights)
+        summary = {
+            "bucket_idx": len(bucket_summaries),
+            "tensor_count": len(weights),
+            "param_updates": summary["param_updates"],
+            "buffer_updates": summary["buffer_updates"],
+            "loaded_buffers": summary["loaded_buffers"],
+        }
+        bucket_summaries.append(summary)
+
+    receiver.receive_weights(on_bucket_received=on_bucket_received)
     return repr(
         {
-            "load_weights": result,
-            "param_updates": len(param_updates),
-            "buffer_updates": len(buffer_updates),
-            "loaded_buffers": loaded_buffers,
+            "device": str(device),
+            "use_shm": use_shm,
+            "bucket_count": len(bucket_summaries),
+            "tensor_count": sum(item["tensor_count"] for item in bucket_summaries),
+            "param_updates": sum(item["param_updates"] for item in bucket_summaries),
+            "buffer_updates": sum(item["buffer_updates"] for item in bucket_summaries),
+            "loaded_buffers": sum(item["loaded_buffers"] for item in bucket_summaries),
+            "buckets": bucket_summaries,
         }
     )
 
@@ -168,6 +221,27 @@ def _apply_model_load_weights(owner: Any, owner_name: str, weights: list[tuple[s
     return False, None
 
 
+def _apply_model_ipc_receiver(owner: Any, owner_name: str, zmq_handle: str, use_shm: bool) -> tuple[bool, Any]:
+    apply_model = safe_getattr(owner, "apply_model")
+    if not callable(apply_model):
+        print(f"{owner_name}.apply_model = MISSING", flush=True)
+        return False, None
+
+    try:
+        print(f"{owner_name}.apply_model signature =", inspect.signature(apply_model), flush=True)
+    except Exception as exc:
+        print(f"{owner_name}.apply_model signature = <unavailable: {type(exc).__name__}: {exc}>", flush=True)
+
+    try:
+        print(f"trying {owner_name}.apply_model ipc_receiver handle={zmq_handle}", flush=True)
+        result = apply_model(functools.partial(_ipc_load_weights_on_worker, zmq_handle=zmq_handle, use_shm=use_shm))
+        print(f"{owner_name}.apply_model ipc_receiver return =", repr(result), flush=True)
+        return True, result
+    except Exception as exc:
+        print(f"{owner_name}.apply_model ipc_receiver failed: {type(exc).__name__}: {exc}", flush=True)
+        return False, None
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Probe syncing a live HF model state_dict into vLLM.")
     parser.add_argument("--model", required=True, help="HF model path used for both HF and vLLM initialization.")
@@ -188,10 +262,39 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--enforce-eager", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--local-files-only", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument(
+        "--sync-backend",
+        choices=("apply_model", "ipc"),
+        default="apply_model",
+        help="Weight sync transport. ipc uses VERL's BucketedWeightSender/Receiver via CUDA IPC or shared memory.",
+    )
+    parser.add_argument(
         "--apply-bucket-mb",
         type=int,
         default=1024,
         help="Max approximate tensor payload per apply_model/load_weights call. Avoids >4GB serialization limits.",
+    )
+    parser.add_argument(
+        "--ipc-bucket-mb",
+        type=int,
+        default=512,
+        help="Communication bucket size for --sync-backend ipc.",
+    )
+    parser.add_argument(
+        "--ipc-use-shm",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Use shared memory instead of CUDA IPC for --sync-backend ipc.",
+    )
+    parser.add_argument(
+        "--ipc-timeout-sec",
+        type=float,
+        default=300.0,
+        help="Timeout while waiting for vLLM apply_model IPC receiver thread.",
+    )
+    parser.add_argument(
+        "--ipc-handle",
+        default=None,
+        help="Optional explicit ZMQ handle. Defaults to a unique ipc:///tmp probe socket.",
     )
     parser.add_argument(
         "--allow-insecure-serialization",
@@ -468,6 +571,108 @@ def try_load_weights(
     return True
 
 
+def get_apply_model_owners(llm: Any) -> list[tuple[str, Any]]:
+    owners = [("llm", llm)]
+    engine = safe_getattr(llm, "llm_engine")
+    if engine is not None:
+        owners.append(("llm.llm_engine", engine))
+    return owners
+
+
+def make_ipc_handle(explicit_handle: str | None) -> str:
+    if explicit_handle:
+        return explicit_handle
+    return f"ipc:///tmp/clight-vllm-ipc-{os.getpid()}-{uuid.uuid4().hex}.sock"
+
+
+def send_weights_via_ipc(
+    weights: list[tuple[str, torch.Tensor]],
+    *,
+    zmq_handle: str,
+    bucket_size_mb: int,
+    use_shm: bool,
+) -> None:
+    from verl.workers.rollout.vllm_rollout.bucketed_weight_transfer import BucketedWeightSender
+
+    sender = BucketedWeightSender(
+        zmq_handle=zmq_handle,
+        bucket_size_mb=bucket_size_mb,
+        use_shm=use_shm,
+    )
+    asyncio.run(sender.async_send_weights(iter(weights)))
+
+
+def try_load_weights_ipc(
+    llm: Any,
+    weights: list[tuple[str, torch.Tensor]],
+    *,
+    bucket_size_mb: int,
+    use_shm: bool,
+    timeout_sec: float,
+    explicit_handle: str | None,
+) -> bool:
+    print("ipc_sync_weight_count =", len(weights), flush=True)
+    print("ipc_bucket_size_mb =", bucket_size_mb, flush=True)
+    print("ipc_use_shm =", use_shm, flush=True)
+    print("llm interesting attrs =", interesting_attrs(llm), flush=True)
+    engine = safe_getattr(llm, "llm_engine")
+    if engine is not None:
+        print("llm.llm_engine type =", type(engine), flush=True)
+        print("llm.llm_engine interesting attrs =", interesting_attrs(engine), flush=True)
+
+    for owner_name, owner in get_apply_model_owners(llm):
+        if not callable(safe_getattr(owner, "apply_model")):
+            print(f"{owner_name}.apply_model = MISSING", flush=True)
+            continue
+
+        zmq_handle = make_ipc_handle(explicit_handle)
+        result_box: dict[str, Any] = {}
+
+        def receiver_target() -> None:
+            ok, result = _apply_model_ipc_receiver(owner, owner_name, zmq_handle, use_shm)
+            result_box["ok"] = ok
+            result_box["result"] = result
+
+        receiver_thread = threading.Thread(
+            target=receiver_target,
+            name=f"vllm-ipc-receiver-{owner_name}",
+            daemon=True,
+        )
+        receiver_thread.start()
+
+        # Give apply_model a moment to either enter the receiver or fail fast
+        # before the sender starts waiting for the IPC handshake.
+        time.sleep(0.5)
+        if "ok" in result_box and not result_box["ok"]:
+            print(f"{owner_name}.apply_model ipc_receiver failed before send; trying next owner", flush=True)
+            continue
+
+        try:
+            start = time.time()
+            send_weights_via_ipc(
+                weights,
+                zmq_handle=zmq_handle,
+                bucket_size_mb=bucket_size_mb,
+                use_shm=use_shm,
+            )
+            print("ipc_sender_done_sec =", f"{time.time() - start:.3f}", flush=True)
+        except Exception as exc:
+            print(f"ipc sender failed for {owner_name}: {type(exc).__name__}: {exc}", flush=True)
+            receiver_thread.join(timeout=1.0)
+            continue
+
+        receiver_thread.join(timeout=timeout_sec)
+        if receiver_thread.is_alive():
+            print(f"{owner_name}.apply_model ipc_receiver timed out after {timeout_sec}s", flush=True)
+            return False
+        if result_box.get("ok"):
+            print("weight_update_path =", f"{owner_name}.apply_model_ipc", flush=True)
+            return True
+        print(f"{owner_name}.apply_model ipc_receiver did not report success; trying next owner", flush=True)
+
+    return False
+
+
 def main() -> None:
     args = parse_args()
     print("=== live HF -> vLLM sync probe ===", flush=True)
@@ -477,6 +682,7 @@ def main() -> None:
     print("hf_torch_dtype =", args.hf_torch_dtype, flush=True)
     print("vllm_dtype =", args.vllm_dtype, flush=True)
     print("all_weights =", args.all_weights, flush=True)
+    print("sync_backend =", args.sync_backend, flush=True)
 
     hf_model = load_hf_model(args)
     state = hf_model.state_dict()
@@ -497,7 +703,19 @@ def main() -> None:
     print("sync_weight_count =", len(weights), flush=True)
     print("sync_weight_source = live_hf_model_state_dict", flush=True)
 
-    if try_load_weights(llm, weights, args.recursive_depth, bucket_size_mb=args.apply_bucket_mb):
+    if args.sync_backend == "ipc":
+        ok = try_load_weights_ipc(
+            llm,
+            weights,
+            bucket_size_mb=args.ipc_bucket_mb,
+            use_shm=args.ipc_use_shm,
+            timeout_sec=args.ipc_timeout_sec,
+            explicit_handle=args.ipc_handle,
+        )
+    else:
+        ok = try_load_weights(llm, weights, args.recursive_depth, bucket_size_mb=args.apply_bucket_mb)
+
+    if ok:
         print("RESULT=OK", flush=True)
     else:
         print("RESULT=NO_WEIGHT_UPDATE_PATH", flush=True)
