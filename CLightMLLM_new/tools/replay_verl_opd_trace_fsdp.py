@@ -116,6 +116,69 @@ def save_fsdp_hf_model(model: FSDP, base_model: torch.nn.Module, processor: Any,
     dist.barrier()
 
 
+def select_fsdp_update_probes(
+    model: torch.nn.Module,
+    *,
+    samples_per_param: int = 2048,
+    max_params: int = 32,
+) -> list[tuple[str, torch.Tensor, torch.Tensor]]:
+    probes: list[tuple[str, torch.Tensor, torch.Tensor]] = []
+    for name, param in model.named_parameters():
+        if not param.requires_grad:
+            continue
+        flat = param.detach().flatten()
+        if flat.numel() == 0:
+            continue
+        sample_count = min(int(samples_per_param), int(flat.numel()))
+        if sample_count == int(flat.numel()):
+            idx = torch.arange(sample_count, device=flat.device, dtype=torch.long)
+        else:
+            idx = torch.linspace(0, flat.numel() - 1, steps=sample_count, device=flat.device).long().unique()
+        probes.append((name, idx, flat[idx].float().clone()))
+        if len(probes) >= max_params:
+            break
+    if not probes:
+        raise RuntimeError("No trainable parameter found for FSDP update probe.")
+    return probes
+
+
+def compute_fsdp_update_stats(
+    model: torch.nn.Module,
+    probes: list[tuple[str, torch.Tensor, torch.Tensor]],
+) -> dict[str, float]:
+    params = dict(model.named_parameters())
+    device = probes[0][1].device
+    local_max = torch.tensor(0.0, device=device)
+    local_sum = torch.tensor(0.0, device=device)
+    local_before_abs_sum = torch.tensor(0.0, device=device)
+    local_count = torch.tensor(0.0, device=device)
+
+    for name, idx, before in probes:
+        param = params.get(name)
+        if param is None:
+            continue
+        after = param.detach().flatten()[idx].float()
+        before = before.to(after.device)
+        delta = (after - before).abs()
+        local_max = torch.maximum(local_max, delta.max())
+        local_sum += delta.sum()
+        local_before_abs_sum += before.abs().sum()
+        local_count += float(delta.numel())
+
+    dist.all_reduce(local_max, op=dist.ReduceOp.MAX)
+    dist.all_reduce(local_sum, op=dist.ReduceOp.SUM)
+    dist.all_reduce(local_before_abs_sum, op=dist.ReduceOp.SUM)
+    dist.all_reduce(local_count, op=dist.ReduceOp.SUM)
+
+    mean_abs = local_sum / local_count.clamp_min(1.0)
+    before_mean_abs = local_before_abs_sum / local_count.clamp_min(1.0)
+    return {
+        "param_update_max_abs": float(local_max.detach().cpu().item()),
+        "param_update_mean_abs": float(mean_abs.detach().cpu().item()),
+        "param_update_rel_mean": float((mean_abs / before_mean_abs.clamp_min(1e-12)).detach().cpu().item()),
+    }
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Replay verl OPD trace dumps with FSDP-sharded CLight student.")
     parser.add_argument("--config", required=True)
@@ -310,10 +373,10 @@ def main() -> None:
 
             if optimizer is not None:
                 optimizer.zero_grad(set_to_none=True)
-                probe_name, probe_idx, probe_before = select_update_probe(model)
-                sync_cuda(device, f"file {file_idx} select_update_probe")
+                update_probes = select_fsdp_update_probes(model)
+                sync_cuda(device, f"file {file_idx} select_fsdp_update_probes")
             else:
-                probe_name, probe_idx, probe_before = "", torch.empty(0), torch.empty(0)
+                update_probes = []
 
             for start in range(local_start, local_end, args.micro_batch_size):
                 end = min(start + args.micro_batch_size, local_end)
@@ -440,8 +503,7 @@ def main() -> None:
                 optimizer.step()
                 if args.debug_dtypes and file_idx == 0 and is_rank0():
                     print(f"[dtype] optimizer_state_dtypes_after_step={optimizer_state_dtype_counts(optimizer)}", flush=True)
-                if is_rank0():
-                    update_stats = compute_update_stats(model, probe_name, probe_idx, probe_before)
+                update_stats = compute_fsdp_update_stats(model, update_probes)
 
             if is_rank0():
                 record = {
