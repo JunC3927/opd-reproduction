@@ -245,9 +245,9 @@ def generate_local_sequences(
         "use_cache": True,
     }
     forward_kwargs.update(build_mm_kwargs(mm_inputs, row_start, row_end, device))
-    mm_token_type_ids = build_mm_token_type_ids(base_model, prompts)
-    if mm_token_type_ids is not None and "image_grid_thw" in forward_kwargs:
-        forward_kwargs["mm_token_type_ids"] = mm_token_type_ids
+    # Some Qwen3-VL generation implementations reject mm_token_type_ids in
+    # GenerationMixin validation. Keep generation on the official HF path and let
+    # the model derive multimodal token types from input_ids/image_grid_thw.
     if position_ids_cpu is not None and args.generate_position_ids_mode != "none":
         raise NotImplementedError(
             "Non-default generate_position_ids_mode is intentionally unsupported for now. "
