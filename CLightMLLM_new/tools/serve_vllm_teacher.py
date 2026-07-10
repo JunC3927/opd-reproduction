@@ -87,6 +87,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=29577)
     parser.add_argument("--topk", type=int, default=32)
+    parser.add_argument("--trust-remote-code", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--torch-dtype", default="bfloat16")
     parser.add_argument("--tensor-parallel-size", type=int, default=1)
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.8)
@@ -125,6 +126,7 @@ def main() -> None:
         f"host={args.host}",
         f"port={args.port}",
         f"model={args.model}",
+        f"trust_remote_code={args.trust_remote_code}",
         f"tp={args.tensor_parallel_size}",
         f"dtype={args.torch_dtype}",
         f"max_model_len={args.max_model_len}",
@@ -145,6 +147,7 @@ def main() -> None:
     scorer = VLLMTeacherScorer(
         model_path=args.model,
         topk=args.topk,
+        trust_remote_code=args.trust_remote_code,
         torch_dtype=args.torch_dtype,
         tensor_parallel_size=args.tensor_parallel_size,
         gpu_memory_utilization=args.gpu_memory_utilization,
