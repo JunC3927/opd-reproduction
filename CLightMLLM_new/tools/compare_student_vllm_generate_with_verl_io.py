@@ -174,6 +174,11 @@ def main() -> None:
         default="trace",
         help="Replay rows in trace order or in the original VERL vLLM IO dump order.",
     )
+    parser.add_argument(
+        "--save-token-ids",
+        action="store_true",
+        help="Store generated token ids in the jsonl output for text diff inspection.",
+    )
     args = parser.parse_args()
 
     from vllm import LLM, SamplingParams
@@ -265,6 +270,9 @@ def main() -> None:
                     "sampling_kwargs": sampling_kwargs,
                     **cmp_result,
                 }
+                if args.save_token_ids:
+                    record["new_generated_token_ids"] = [int(x) for x in new_ids]
+                    record["old_generated_token_ids"] = [int(x) for x in old_ids]
                 f.write(json.dumps(record, ensure_ascii=False) + "\n")
                 print(
                     f"idx={total - 1} trace_i={record['trace_i']} row={record['row']} "
