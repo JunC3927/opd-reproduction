@@ -168,11 +168,31 @@ def main() -> None:
     parser.add_argument("--trust-remote-code", action="store_true")
     parser.add_argument("--default-top-p", type=float, default=1.0)
     parser.add_argument("--default-top-k", type=int, default=-1)
+    parser.add_argument(
+        "--order",
+        choices=("trace", "vllm-dump"),
+        default="trace",
+        help="Replay rows in trace order or in the original VERL vLLM IO dump order.",
+    )
     args = parser.parse_args()
 
     from vllm import LLM, SamplingParams
 
     rows = [row for row in load_jsonl(args.alignment) if row.get("matched")]
+    if args.order == "vllm-dump":
+        row_payload_pairs = []
+        for row in rows:
+            payload = torch.load(row["student_vllm_io"], map_location="cpu", weights_only=False)
+            row_payload_pairs.append((row, payload))
+        row_payload_pairs.sort(
+            key=lambda item: (
+                get_nested(item[1], "node_rank") if get_nested(item[1], "node_rank") is not None else -1,
+                get_nested(item[1], "replica_rank") if get_nested(item[1], "replica_rank") is not None else -1,
+                get_nested(item[1], "dump_index") if get_nested(item[1], "dump_index") is not None else 10**18,
+                str(item[0].get("student_vllm_io")),
+            )
+        )
+        rows = [row for row, _ in row_payload_pairs]
     if args.max_samples > 0:
         rows = rows[: args.max_samples]
     if not rows:
@@ -198,6 +218,7 @@ def main() -> None:
     print(f"model={args.model}", flush=True)
     print(f"samples={len(rows)}", flush=True)
     print(f"micro_batch_size={args.micro_batch_size}", flush=True)
+    print(f"order={args.order}", flush=True)
     print(f"llm_kwargs={llm_kwargs}", flush=True)
 
     llm = LLM(**llm_kwargs)
