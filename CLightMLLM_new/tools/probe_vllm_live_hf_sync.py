@@ -161,6 +161,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--trust-remote-code", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--enforce-eager", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--local-files-only", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument(
+        "--allow-insecure-serialization",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Allow vLLM apply_model to pickle a functools.partial carrying probe tensors. "
+            "This is for local probing only; VERL avoids this by using IPC bucket transfer."
+        ),
+    )
     parser.add_argument("--recursive-depth", type=int, default=5)
     return parser.parse_args()
 
@@ -299,6 +308,8 @@ def apply_buffer_updates(
 
 def load_vllm(args: argparse.Namespace) -> Any:
     os.environ.setdefault("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
+    if args.allow_insecure_serialization:
+        os.environ.setdefault("VLLM_ALLOW_INSECURE_SERIALIZATION", "1")
     from vllm import LLM
 
     kwargs: dict[str, Any] = {
