@@ -34,8 +34,26 @@ def resolve_cuda_device(device: str | None) -> str | None:
     return device
 
 
+def resolve_visible_device_for_child(device: str | None) -> str | None:
+    if device is None or not str(device).startswith("cuda"):
+        return None
+    index = torch.device(device).index
+    if index is None:
+        return None
+    visible = os.environ.get("CUDA_VISIBLE_DEVICES")
+    if not visible:
+        return str(index)
+    entries = [entry.strip() for entry in visible.split(",") if entry.strip()]
+    if index >= len(entries):
+        raise ValueError(
+            f"Requested student vLLM device {device}, but CUDA_VISIBLE_DEVICES={visible!r} "
+            f"only exposes {len(entries)} device(s)."
+        )
+    return entries[index]
+
+
 @contextmanager
-def isolated_vllm_distributed_env():
+def isolated_vllm_distributed_env(cuda_visible_devices: str | None = None):
     """Prevent vLLM worker subprocesses from inheriting torchrun ranks."""
     keys = [
         "RANK",
@@ -52,9 +70,13 @@ def isolated_vllm_distributed_env():
         "TORCHELASTIC_RESTART_COUNT",
         "TORCHELASTIC_MAX_RESTARTS",
     ]
+    if cuda_visible_devices is not None:
+        keys.append("CUDA_VISIBLE_DEVICES")
     saved = {key: os.environ.get(key) for key in keys}
     for key in keys:
         os.environ.pop(key, None)
+    if cuda_visible_devices is not None:
+        os.environ["CUDA_VISIBLE_DEVICES"] = cuda_visible_devices
     try:
         yield
     finally:
@@ -184,6 +206,7 @@ class VLLMStudentRollout:
         device = resolve_cuda_device(device)
         self.device = device
         self.visible_devices = visible_devices
+        self.vllm_worker_visible_device = resolve_visible_device_for_child(device)
 
         if visible_devices is not None:
             current_visible = os.environ.get("CUDA_VISIBLE_DEVICES")
@@ -254,7 +277,7 @@ class VLLMStudentRollout:
             llm_kwargs["limit_mm_per_prompt"] = limit_mm_per_prompt
 
         try:
-            with isolated_vllm_distributed_env():
+            with isolated_vllm_distributed_env(cuda_visible_devices=self.vllm_worker_visible_device):
                 self.llm = LLM(**llm_kwargs)
         finally:
             if previous_device is not None:
@@ -427,18 +450,13 @@ class VLLMStudentRollout:
                 "path": "skipped_empty",
             }
 
-        prepared_weights = []
-        for name, tensor in weights:
-            if not torch.is_tensor(tensor):
-                continue
-            value = tensor.detach()
-            if sync_dtype is not None and value.is_floating_point():
-                value = value.to(dtype=sync_dtype)
-            if use_shm:
-                value = value.cpu()
-            elif not value.is_cuda:
-                value = value.cuda()
-            prepared_weights.append((name, value.contiguous()))
+        previous_device = None
+        ipc_device = None
+        if not use_shm and self.device is not None and str(self.device).startswith("cuda") and torch.cuda.is_available():
+            ipc_device = torch.device(self.device)
+            previous_device = torch.cuda.current_device()
+            if ipc_device.index is not None:
+                torch.cuda.set_device(ipc_device.index)
 
         apply_model = getattr(self.llm, "apply_model", None)
         owner_name = "llm"
@@ -451,44 +469,63 @@ class VLLMStudentRollout:
         if not callable(apply_model):
             raise RuntimeError("Could not find llm.apply_model or llm.llm_engine.apply_model for IPC sync.")
 
-        zmq_handle = f"ipc:///tmp/clight-student-vllm-ipc-{os.getpid()}-{uuid.uuid4().hex}.sock"
-        result_box: dict[str, Any] = {}
+        try:
+            prepared_weights = []
+            for name, tensor in weights:
+                if not torch.is_tensor(tensor):
+                    continue
+                value = tensor.detach()
+                if sync_dtype is not None and value.is_floating_point():
+                    value = value.to(dtype=sync_dtype)
+                if use_shm:
+                    value = value.cpu()
+                elif ipc_device is not None:
+                    value = value.to(device=ipc_device, non_blocking=True)
+                elif not value.is_cuda:
+                    value = value.cuda()
+                prepared_weights.append((name, value.contiguous()))
 
-        def receiver_target() -> None:
-            try:
-                result_box["result"] = apply_model(
-                    functools.partial(_ipc_load_weights_on_worker, zmq_handle=zmq_handle, use_shm=use_shm)
-                )
-                result_box["ok"] = True
-            except Exception as exc:
-                result_box["ok"] = False
-                result_box["error"] = f"{type(exc).__name__}: {exc}"
+            zmq_handle = f"ipc:///tmp/clight-student-vllm-ipc-{os.getpid()}-{uuid.uuid4().hex}.sock"
+            result_box: dict[str, Any] = {}
 
-        total_start = time.time()
-        receiver_thread = threading.Thread(
-            target=receiver_target,
-            name="clight-student-vllm-ipc-receiver",
-            daemon=True,
-        )
-        receiver_thread.start()
-        time.sleep(0.5)
-        if result_box.get("ok") is False:
-            raise RuntimeError(f"Student vLLM IPC receiver failed before send: {result_box.get('error')}")
+            def receiver_target() -> None:
+                try:
+                    result_box["result"] = apply_model(
+                        functools.partial(_ipc_load_weights_on_worker, zmq_handle=zmq_handle, use_shm=use_shm)
+                    )
+                    result_box["ok"] = True
+                except Exception as exc:
+                    result_box["ok"] = False
+                    result_box["error"] = f"{type(exc).__name__}: {exc}"
 
-        sender_start = time.time()
-        _send_weights_via_ipc(
-            prepared_weights,
-            zmq_handle=zmq_handle,
-            bucket_size_mb=bucket_size_mb,
-            use_shm=use_shm,
-        )
-        sender_sec = time.time() - sender_start
+            total_start = time.time()
+            receiver_thread = threading.Thread(
+                target=receiver_target,
+                name="clight-student-vllm-ipc-receiver",
+                daemon=True,
+            )
+            receiver_thread.start()
+            time.sleep(0.5)
+            if result_box.get("ok") is False:
+                raise RuntimeError(f"Student vLLM IPC receiver failed before send: {result_box.get('error')}")
 
-        receiver_thread.join(timeout=timeout_sec)
-        if receiver_thread.is_alive():
-            raise TimeoutError(f"Student vLLM IPC receiver timed out after {timeout_sec}s.")
-        if not result_box.get("ok"):
-            raise RuntimeError(f"Student vLLM IPC receiver failed: {result_box.get('error')}")
+            sender_start = time.time()
+            _send_weights_via_ipc(
+                prepared_weights,
+                zmq_handle=zmq_handle,
+                bucket_size_mb=bucket_size_mb,
+                use_shm=use_shm,
+            )
+            sender_sec = time.time() - sender_start
+
+            receiver_thread.join(timeout=timeout_sec)
+            if receiver_thread.is_alive():
+                raise TimeoutError(f"Student vLLM IPC receiver timed out after {timeout_sec}s.")
+            if not result_box.get("ok"):
+                raise RuntimeError(f"Student vLLM IPC receiver failed: {result_box.get('error')}")
+        finally:
+            if previous_device is not None:
+                torch.cuda.set_device(previous_device)
 
         total_sec = time.time() - total_start
         if os.getenv("CLIGHT_OPD_VLLM_DEBUG") == "1" and is_rank_zero_process():
