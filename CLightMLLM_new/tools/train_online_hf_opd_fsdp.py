@@ -239,7 +239,17 @@ def generate_local_sequences(
             attention_mask = torch.cat([attention_mask, token_attention.unsqueeze(1)], dim=1)
             if eos_token_id is not None:
                 finished = finished | next_token.eq(int(eos_token_id))
-            if bool(finished.all().item()):
+
+            # FSDP forward contains collectives, so all ranks must run the same
+            # number of generation iterations. Only stop early when every rank
+            # has finished all of its local samples.
+            local_done = torch.tensor(
+                1 if bool(finished.all().item()) else 0,
+                dtype=torch.int32,
+                device=device,
+            )
+            dist.all_reduce(local_done, op=dist.ReduceOp.MIN)
+            if int(local_done.item()) == 1:
                 break
 
     if was_training:
