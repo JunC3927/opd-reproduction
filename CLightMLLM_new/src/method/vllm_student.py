@@ -1,5 +1,6 @@
 import os
 import asyncio
+from contextlib import contextmanager
 import functools
 import sys
 import threading
@@ -31,6 +32,37 @@ def resolve_cuda_device(device: str | None) -> str | None:
             return None
         return f"cuda:{int(os.environ.get('LOCAL_RANK', '0'))}"
     return device
+
+
+@contextmanager
+def isolated_vllm_distributed_env():
+    """Prevent vLLM worker subprocesses from inheriting torchrun ranks."""
+    keys = [
+        "RANK",
+        "WORLD_SIZE",
+        "LOCAL_RANK",
+        "LOCAL_WORLD_SIZE",
+        "GROUP_RANK",
+        "GROUP_WORLD_SIZE",
+        "ROLE_RANK",
+        "ROLE_WORLD_SIZE",
+        "MASTER_ADDR",
+        "MASTER_PORT",
+        "TORCHELASTIC_RUN_ID",
+        "TORCHELASTIC_RESTART_COUNT",
+        "TORCHELASTIC_MAX_RESTARTS",
+    ]
+    saved = {key: os.environ.get(key) for key in keys}
+    for key in keys:
+        os.environ.pop(key, None)
+    try:
+        yield
+    finally:
+        for key, value in saved.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
 
 
 def _load_weights_into_model(model: Any, weights: list[tuple[str, torch.Tensor]]) -> dict[str, Any]:
@@ -222,7 +254,8 @@ class VLLMStudentRollout:
             llm_kwargs["limit_mm_per_prompt"] = limit_mm_per_prompt
 
         try:
-            self.llm = LLM(**llm_kwargs)
+            with isolated_vllm_distributed_env():
+                self.llm = LLM(**llm_kwargs)
         finally:
             if previous_device is not None:
                 torch.cuda.set_device(previous_device)
