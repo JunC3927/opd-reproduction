@@ -57,7 +57,7 @@ def apply_verl_monkey_patch_if_requested(model: torch.nn.Module, model_args: Mod
         )
 
 
-def load_vision_language_model(model_args: ModelArguments, template_name: str):
+def load_processor_and_tokenizer(model_args: ModelArguments):
     if not model_args.model_name_or_path:
         raise ValueError("model.model_name_or_path is required.")
 
@@ -74,6 +74,11 @@ def load_vision_language_model(model_args: ModelArguments, template_name: str):
     tokenizer.padding_side = model_args.padding_side
     if tokenizer.pad_token_id is None:
         tokenizer.pad_token = tokenizer.eos_token
+    return processor, tokenizer, common_kwargs
+
+
+def load_vision_language_model(model_args: ModelArguments, template_name: str):
+    processor, tokenizer, common_kwargs = load_processor_and_tokenizer(model_args)
 
     model_kwargs: dict[str, Any] = {**common_kwargs, "torch_dtype": parse_torch_dtype(model_args.torch_dtype)}
     if model_args.device_map is not None:

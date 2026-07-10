@@ -64,7 +64,7 @@ from replay_verl_opd_trace_fsdp import (  # noqa: E402
 )
 from src.method.vllm_teacher_client import RemoteTeacherScorer  # noqa: E402
 from src.method.vllm_student import VLLMStudentRollout  # noqa: E402
-from src.model import ModelTuner, load_vision_language_model  # noqa: E402
+from src.model import ModelTuner, load_processor_and_tokenizer, load_vision_language_model  # noqa: E402
 
 
 def is_rank0() -> bool:
@@ -727,21 +727,50 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def build_student_vllm_rollout(
+    *,
+    args: argparse.Namespace,
+    model_args: Any,
+    tokenizer: Any,
+    local_rank: int,
+) -> VLLMStudentRollout:
+    rank_print("student_vllm_init_start=True")
+    os.environ.setdefault("VLLM_USE_V1", "1")
+    os.environ.setdefault("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
+    if args.rollout_backend == "vllm_ipc" and os.environ.get("VLLM_ENABLE_V1_MULTIPROCESSING") == "0":
+        rank_print("student_vllm_enable_v1_multiprocessing_override=0_to_1")
+        os.environ["VLLM_ENABLE_V1_MULTIPROCESSING"] = "1"
+    rank_print(f"student_vllm_use_v1={os.environ.get('VLLM_USE_V1')}")
+    rank_print(f"student_vllm_worker_multiproc_method={os.environ.get('VLLM_WORKER_MULTIPROC_METHOD')}")
+    if os.environ.get("VLLM_ENABLE_V1_MULTIPROCESSING") is not None:
+        rank_print(f"student_vllm_enable_v1_multiprocessing={os.environ.get('VLLM_ENABLE_V1_MULTIPROCESSING')}")
+    if model_args.model_name_or_path is None:
+        raise ValueError(f"rollout_backend={args.rollout_backend} requires model.model_name_or_path in the config.")
+    rollout = VLLMStudentRollout(
+        model_path=model_args.model_name_or_path,
+        tokenizer=tokenizer,
+        torch_dtype=args.student_vllm_dtype,
+        trust_remote_code=model_args.trust_remote_code,
+        tensor_parallel_size=1,
+        gpu_memory_utilization=args.student_vllm_gpu_memory_utilization,
+        max_model_len=args.student_vllm_max_model_len,
+        max_num_batched_tokens=args.student_vllm_max_num_batched_tokens,
+        max_num_seqs=args.student_vllm_max_num_seqs,
+        enforce_eager=args.student_vllm_enforce_eager,
+        device=args.student_vllm_device or f"cuda:{local_rank}",
+        disable_log_stats=True,
+        seed=0,
+        limit_mm_per_prompt={"image": 1, "video": 0},
+    )
+    rank_print("student_vllm_init_done=True")
+    return rollout
+
+
 def main() -> None:
     args = parse_args()
     os.chdir(ROOT)
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
-    rank, world_size, local_rank, device = init_distributed(timeout_sec=args.dist_timeout_sec)
-
-    if args.samples_per_update % world_size != 0:
-        raise ValueError(
-            f"samples_per_update={args.samples_per_update} must be divisible by world_size={world_size}."
-        )
-    if args.rollout_backend == "vllm_single" and world_size != 1:
-        raise ValueError("rollout_backend=vllm_single is only for a single training process. Use nproc_per_node=1.")
-    if args.rollout_backend == "vllm_ipc" and world_size < 2:
-        raise ValueError("rollout_backend=vllm_ipc is intended for multi-rank FSDP. Use vllm_single for world_size=1.")
 
     (
         _cl_sft_args,
@@ -758,6 +787,30 @@ def main() -> None:
     model_args = replace(model_args, use_cache=args.rollout_backend in {"manual_cache", "hf_generate"})
     if args.gradient_checkpointing and hasattr(model_args, "gradient_checkpointing"):
         model_args = replace(model_args, gradient_checkpointing=True)
+
+    student_rollout = None
+    pre_dist_rank = int(os.environ.get("RANK", "0"))
+    pre_dist_local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+    if args.rollout_backend in {"vllm_single", "vllm_ipc"} and pre_dist_rank == 0:
+        rank_print("student_vllm_pre_distributed_init=True")
+        _student_processor, student_tokenizer, _common_kwargs = load_processor_and_tokenizer(model_args)
+        student_rollout = build_student_vllm_rollout(
+            args=args,
+            model_args=model_args,
+            tokenizer=student_tokenizer,
+            local_rank=pre_dist_local_rank,
+        )
+
+    rank, world_size, local_rank, device = init_distributed(timeout_sec=args.dist_timeout_sec)
+
+    if args.samples_per_update % world_size != 0:
+        raise ValueError(
+            f"samples_per_update={args.samples_per_update} must be divisible by world_size={world_size}."
+        )
+    if args.rollout_backend == "vllm_single" and world_size != 1:
+        raise ValueError("rollout_backend=vllm_single is only for a single training process. Use nproc_per_node=1.")
+    if args.rollout_backend == "vllm_ipc" and world_size < 2:
+        raise ValueError("rollout_backend=vllm_ipc is intended for multi-rank FSDP. Use vllm_single for world_size=1.")
 
     paths = sorted(expand_paths(args.traces), key=trace_sort_key)
     if not paths:
@@ -792,31 +845,17 @@ def main() -> None:
         timeout=args.teacher_timeout,
         topk=args.topk,
     )
-    student_rollout = None
     if args.rollout_backend in {"vllm_single", "vllm_ipc"} and is_rank0():
-        rank_print("student_vllm_init_start=True")
-        os.environ.setdefault("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
-        os.environ.setdefault("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
-        rank_print(f"student_vllm_enable_v1_multiprocessing={os.environ.get('VLLM_ENABLE_V1_MULTIPROCESSING')}")
-        if model_args.model_name_or_path is None:
-            raise ValueError(f"rollout_backend={args.rollout_backend} requires model.model_name_or_path in the config.")
-        student_rollout = VLLMStudentRollout(
-            model_path=model_args.model_name_or_path,
-            tokenizer=tokenizer,
-            torch_dtype=args.student_vllm_dtype,
-            trust_remote_code=model_args.trust_remote_code,
-            tensor_parallel_size=1,
-            gpu_memory_utilization=args.student_vllm_gpu_memory_utilization,
-            max_model_len=args.student_vllm_max_model_len,
-            max_num_batched_tokens=args.student_vllm_max_num_batched_tokens,
-            max_num_seqs=args.student_vllm_max_num_seqs,
-            enforce_eager=args.student_vllm_enforce_eager,
-            device=args.student_vllm_device or f"cuda:{local_rank}",
-            disable_log_stats=True,
-            seed=0,
-            limit_mm_per_prompt={"image": 1, "video": 0},
-        )
-        rank_print("student_vllm_init_done=True")
+        if student_rollout is None:
+            student_rollout = build_student_vllm_rollout(
+                args=args,
+                model_args=model_args,
+                tokenizer=tokenizer,
+                local_rank=local_rank,
+            )
+        else:
+            # Keep the rollout tokenizer aligned with the processor used by training.
+            student_rollout.tokenizer = tokenizer
     if args.rollout_backend == "vllm_ipc":
         dist.barrier()
         rank_print("student_vllm_init_barrier_done=True")
