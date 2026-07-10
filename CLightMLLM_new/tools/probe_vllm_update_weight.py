@@ -180,12 +180,17 @@ def main() -> None:
     args = parse_args()
     model_dir = Path(args.model)
 
+    # vLLM V1 starts an EngineCore subprocess. If this process has already
+    # initialized CUDA, fork-based startup can fail with
+    # "Cannot re-initialize CUDA in forked subprocess".
+    os.environ.setdefault("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
+
     print("=== vLLM update weight probe ===")
     print("model =", args.model)
     print("CUDA_VISIBLE_DEVICES =", os.environ.get("CUDA_VISIBLE_DEVICES"))
     print("VLLM_USE_V1 =", os.environ.get("VLLM_USE_V1"))
+    print("VLLM_WORKER_MULTIPROC_METHOD =", os.environ.get("VLLM_WORKER_MULTIPROC_METHOD"))
     print("torch =", torch.__version__)
-    print("cuda =", torch.cuda.is_available(), torch.cuda.device_count())
 
     from vllm import LLM
 
