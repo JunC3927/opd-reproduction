@@ -18,6 +18,11 @@ from torch.distributed.fsdp import (
 )
 from torch.distributed.fsdp.wrap import size_based_auto_wrap_policy
 
+try:
+    from tqdm.auto import tqdm
+except Exception:  # pragma: no cover - tqdm may not be installed in lean envs.
+    tqdm = None
+
 ROOT = Path(__file__).resolve().parents[1]
 TOOLS = Path(__file__).resolve().parent
 for path in (ROOT, TOOLS):
@@ -64,6 +69,21 @@ def is_rank0() -> bool:
 def rank_print(*args: Any, **kwargs: Any) -> None:
     if is_rank0():
         print(*args, **kwargs)
+
+
+def progress_write(progress: Any, message: str) -> None:
+    if progress is not None:
+        progress.write(message)
+    else:
+        print(message, flush=True)
+
+
+def estimate_initial_total_updates(paths: list[str], args: argparse.Namespace) -> int:
+    if args.max_updates > 0:
+        return int(args.max_updates)
+    # In the VERL trace dump layout used here each chunk file is normally one update.
+    # If a file contains multiple update groups, the tqdm total is adjusted after loading it.
+    return int(len(paths) * args.epochs)
 
 
 def trace_sort_key(path: str) -> tuple[int, int, int, str]:
@@ -483,6 +503,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--fsdp-min-num-params", type=int, default=10_000_000)
     parser.add_argument("--gradient-checkpointing", action="store_true")
     parser.add_argument("--debug-dtypes", action="store_true")
+    parser.add_argument("--no-progress", action="store_true", help="Disable the rank-0 tqdm progress bar.")
     parser.add_argument("--disable-update-probe", action="store_true")
     parser.add_argument("--update-probe-samples", type=int, default=64)
     parser.add_argument("--update-probe-max-params", type=int, default=1)
@@ -605,6 +626,19 @@ def main() -> None:
         )
 
     update_step = 0
+    progress = None
+    if is_rank0() and not args.no_progress:
+        if tqdm is None:
+            rank_print("progress_bar=disabled reason=tqdm_not_installed")
+        else:
+            progress = tqdm(
+                total=estimate_initial_total_updates(paths, args),
+                desc="online updates",
+                unit="upd",
+                dynamic_ncols=True,
+                leave=True,
+            )
+
     try:
         for epoch in range(args.epochs):
             for path in paths:
@@ -621,6 +655,15 @@ def main() -> None:
                     raise ValueError(
                         f"{path} has {source_rows} rows, fewer than samples_per_update={args.samples_per_update}."
                     )
+                groups_in_file = usable_rows // args.samples_per_update
+                if (
+                    is_rank0()
+                    and progress is not None
+                    and args.max_updates <= 0
+                    and groups_in_file > 1
+                ):
+                    progress.total = int(progress.total or 0) + groups_in_file - 1
+                    progress.refresh()
 
                 for group_start in range(0, usable_rows, args.samples_per_update):
                     if args.max_updates > 0 and update_step >= args.max_updates:
@@ -875,7 +918,7 @@ def main() -> None:
                             "train_amp_dtype": args.train_amp_dtype,
                         }
                         record.update(update_stats)
-                        print(
+                        message = (
                             " | ".join(
                                 [
                                     f"step={update_step}",
@@ -891,9 +934,18 @@ def main() -> None:
                                     f"grad_norm={record['grad_norm']:.8f}",
                                     f"resp_len_mean={record['response_len_mean']:.2f}",
                                 ]
-                            ),
-                            flush=True,
+                            )
                         )
+                        progress_write(progress, message)
+                        if progress is not None:
+                            progress.set_postfix(
+                                loss=f"{record['loss']:.4f}",
+                                grad=f"{record['grad_norm']:.2f}",
+                                tokens=record["tokens"],
+                                resp=f"{record['response_len_mean']:.1f}",
+                                refresh=False,
+                            )
+                            progress.update(1)
                         if metrics_output is not None:
                             metrics_output.write(json.dumps(record, ensure_ascii=False) + "\n")
                             metrics_output.flush()
@@ -909,6 +961,8 @@ def main() -> None:
         if args.save_model_dir:
             save_fsdp_hf_model(model, base_model, processor, args.save_model_dir)
     finally:
+        if progress is not None:
+            progress.close()
         if metrics_output is not None:
             metrics_output.close()
         if swanlab_run is not None:
