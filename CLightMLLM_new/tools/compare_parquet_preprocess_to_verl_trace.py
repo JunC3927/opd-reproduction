@@ -52,6 +52,43 @@ def active_ids(ids: Any, mask: Any) -> list[int]:
     return ids_t[mask_t].tolist()
 
 
+def common_prefix_len(left: list[int], right: list[int]) -> int:
+    count = 0
+    for a, b in zip(left, right, strict=False):
+        if a != b:
+            break
+        count += 1
+    return count
+
+
+def same_ratio(left: list[int], right: list[int]) -> float:
+    width = min(len(left), len(right))
+    if width == 0:
+        return 1.0 if len(left) == len(right) else 0.0
+    return sum(a == b for a, b in zip(left[:width], right[:width], strict=False)) / width
+
+
+def infer_mm_token_ids(tokenizer: Any, image_token_id: int | None = None) -> set[int]:
+    tokens = ["<|image_pad|>", "<|video_pad|>", "<|vision_start|>", "<|vision_end|>"]
+    token_ids: set[int] = set()
+    for token in tokens:
+        try:
+            token_id = tokenizer.convert_tokens_to_ids(token)
+        except Exception:
+            token_id = None
+        if isinstance(token_id, int) and token_id >= 0:
+            token_ids.add(token_id)
+    if image_token_id is not None:
+        token_ids.add(image_token_id)
+    return token_ids
+
+
+def strip_token_ids(ids: list[int], remove_ids: set[int]) -> list[int]:
+    if not remove_ids:
+        return ids
+    return [token_id for token_id in ids if token_id not in remove_ids]
+
+
 def trace_prompt_rows(trace: dict[str, Any]) -> list[list[int]]:
     batch = trace["batch"]
     prompts = batch["prompts"].detach().cpu().long()
@@ -132,6 +169,42 @@ def trace_mm_kwargs(trace: dict[str, Any], row: int) -> dict[str, Any] | None:
 
 def sample_images(sample: dict[str, Any]) -> list[Any]:
     return to_list(sample.get("images"))
+
+
+def closest_prompt_match(
+    *,
+    prompt_ids: list[int],
+    dataset_prompts: list[list[int]],
+    dataset_image_counts: list[int],
+    trace_image_count: int,
+    mm_token_ids: set[int],
+) -> dict[str, Any] | None:
+    stripped_prompt = strip_token_ids(prompt_ids, mm_token_ids)
+    best: dict[str, Any] | None = None
+    for index, candidate in enumerate(dataset_prompts):
+        stripped_candidate = strip_token_ids(candidate, mm_token_ids)
+        strip_mm_same = stripped_prompt == stripped_candidate
+        score = (
+            1 if dataset_image_counts[index] == trace_image_count else 0,
+            1 if strip_mm_same else 0,
+            common_prefix_len(prompt_ids, candidate),
+            same_ratio(prompt_ids, candidate),
+        )
+        if best is None or score > best["_score"]:
+            best = {
+                "_score": score,
+                "closest_dataset_index": index,
+                "closest_prompt_len": len(candidate),
+                "closest_image_count": dataset_image_counts[index],
+                "closest_common_prefix": score[2],
+                "closest_same_ratio": score[3],
+                "strip_mm_same": strip_mm_same,
+                "stripped_trace_len": len(stripped_prompt),
+                "stripped_dataset_len": len(stripped_candidate),
+            }
+    if best is not None:
+        best.pop("_score", None)
+    return best
 
 
 def _as_python(value: Any) -> Any:
@@ -331,14 +404,19 @@ def main() -> None:
     )
     parser.add_argument("--output", default=None, help="Optional JSONL output path.")
     parser.add_argument("--print-first", type=int, default=12)
+    parser.add_argument("--image-token-id", type=int, default=151655)
     args = parser.parse_args()
 
     trace_paths = expand_paths(args.traces)
     dataset, template, tokenizer, processor, model_args = build_dataset(args)
 
+    dataset_prompts = [[int(x) for x in dataset[index]["prompt_input_ids"]] for index in range(len(dataset))]
+    dataset_image_counts = [len(sample_images(dataset[index])) for index in range(len(dataset))]
+    mm_token_ids = infer_mm_token_ids(tokenizer, args.image_token_id)
+
     by_prompt: dict[tuple[int, ...], list[int]] = defaultdict(list)
-    for index in range(len(dataset)):
-        by_prompt[tuple(int(x) for x in dataset[index]["prompt_input_ids"])].append(index)
+    for index, prompt_ids in enumerate(dataset_prompts):
+        by_prompt[tuple(prompt_ids)].append(index)
 
     records: list[dict[str, Any]] = []
     matched_indices: list[int] = []
@@ -371,6 +449,17 @@ def main() -> None:
                 "trace_image_summary": [image_summary(image) for image in trace_imgs[:2]],
                 "dataset_image_summary": [image_summary(image) for image in sample_imgs[:2]],
             }
+            if dataset_index is None:
+                record.update(
+                    closest_prompt_match(
+                        prompt_ids=prompt_ids,
+                        dataset_prompts=dataset_prompts,
+                        dataset_image_counts=dataset_image_counts,
+                        trace_image_count=len(trace_imgs),
+                        mm_token_ids=mm_token_ids,
+                    )
+                    or {}
+                )
             records.append(record)
 
     unique_matched = sorted(set(index for index in matched_indices if index is not None))
@@ -431,6 +520,16 @@ def main() -> None:
             record["prompt_len"],
             "image_count_same=",
             record["image_count_same"],
+            "closest_dataset_index=",
+            record.get("closest_dataset_index"),
+            "closest_prompt_len=",
+            record.get("closest_prompt_len"),
+            "strip_mm_same=",
+            record.get("strip_mm_same"),
+            "closest_common_prefix=",
+            record.get("closest_common_prefix"),
+            "closest_same_ratio=",
+            record.get("closest_same_ratio"),
         )
     ok = prompt_matched == total and image_count_same == prompt_matched
     print(f"RESULT={'OK' if ok else 'FAIL'}")
