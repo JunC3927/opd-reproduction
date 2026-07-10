@@ -3,6 +3,7 @@ import json
 import os
 import re
 import sys
+import time
 from contextlib import nullcontext
 from dataclasses import replace
 from functools import partial
@@ -15,7 +16,9 @@ import torch.distributed as dist
 from torch.distributed.fsdp import (
     BackwardPrefetch,
     FullyShardedDataParallel as FSDP,
+    FullStateDictConfig,
     ShardingStrategy,
+    StateDictType,
 )
 from torch.distributed.fsdp.wrap import size_based_auto_wrap_policy
 
@@ -180,6 +183,17 @@ def autocast_context(dtype: str):
     return nullcontext()
 
 
+def parse_sync_dtype(dtype: str) -> torch.dtype | None:
+    normalized = str(dtype).lower().replace("torch.", "")
+    if normalized in {"none", "fp32", "float32"}:
+        return None if normalized == "none" else torch.float32
+    if normalized in {"bf16", "bfloat16"}:
+        return torch.bfloat16
+    if normalized in {"fp16", "float16"}:
+        return torch.float16
+    raise ValueError(f"Unsupported sync dtype {dtype!r}.")
+
+
 def sample_next_token(logits: torch.Tensor, args: argparse.Namespace) -> torch.Tensor:
     logits = logits.float()
     if not args.rollout_do_sample:
@@ -283,9 +297,9 @@ def generate_local_sequences(
     past_key_values = None
 
     with torch.no_grad():
-        if args.rollout_backend == "vllm_single":
+        if args.rollout_backend in {"vllm_single", "vllm_ipc"}:
             if student_rollout is None:
-                raise RuntimeError("rollout_backend=vllm_single requires a student_rollout instance.")
+                raise RuntimeError(f"rollout_backend={args.rollout_backend} requires a student_rollout instance.")
             rollout_batch = {
                 "prompt_input_ids": sequences,
                 "prompt_attention_mask": attention_mask,
@@ -386,6 +400,124 @@ def generate_local_sequences(
     prompt_attention_mask = batch["attention_mask"][row_start:row_end, :prompt_width].cpu().long()
     attention_mask = torch.cat([prompt_attention_mask, response_mask], dim=1)
     return input_ids, attention_mask, response_mask
+
+
+def collect_rank0_fsdp_weights(model: FSDP) -> list[tuple[str, torch.Tensor]] | None:
+    cfg = FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
+    with FSDP.state_dict_type(model, StateDictType.FULL_STATE_DICT, cfg):
+        state = model.state_dict()
+    if not is_rank0():
+        return None
+    return [(name, tensor.detach()) for name, tensor in state.items() if torch.is_tensor(tensor)]
+
+
+def scatter_tensor_from_rank0(
+    tensor: torch.Tensor | None,
+    *,
+    local_shape: tuple[int, ...],
+    dtype: torch.dtype,
+    device: torch.device,
+    world_size: int,
+) -> torch.Tensor:
+    output = torch.empty(local_shape, dtype=dtype, device=device)
+    scatter_list = None
+    if is_rank0():
+        if tensor is None:
+            raise RuntimeError("rank0 scatter source tensor is missing.")
+        scatter_list = [chunk.contiguous().to(device) for chunk in torch.chunk(tensor, world_size, dim=0)]
+    dist.scatter(output, scatter_list=scatter_list, src=0)
+    return output.detach().cpu()
+
+
+def generate_vllm_ipc_global_sequences(
+    *,
+    model: FSDP,
+    base_model: torch.nn.Module,
+    student_rollout: VLLMStudentRollout,
+    batch: dict[str, Any],
+    non_tensor: dict[str, Any],
+    mm_inputs: list[Any],
+    position_ids_cpu: torch.Tensor | None,
+    group_start: int,
+    group_end: int,
+    local_rows: int,
+    prompt_width: int,
+    response_width: int,
+    tokenizer: Any,
+    device: torch.device,
+    image_token_id: int | None,
+    video_token_id: int | None,
+    args: argparse.Namespace,
+    world_size: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, dict[str, float | int | str]]:
+    sync_start = time.time()
+    weights = collect_rank0_fsdp_weights(model)
+    sync_info: dict[str, Any] = {}
+    if is_rank0():
+        sync_info = student_rollout.sync_from_weight_items_ipc(
+            weights or [],
+            bucket_size_mb=args.student_vllm_ipc_bucket_mb,
+            use_shm=args.student_vllm_ipc_use_shm,
+            timeout_sec=args.student_vllm_ipc_timeout_sec,
+            sync_dtype=parse_sync_dtype(args.student_vllm_sync_dtype),
+        )
+    dist.barrier()
+    sync_sec = time.time() - sync_start
+
+    rollout_start = time.time()
+    full_sequences = None
+    full_attention = None
+    full_response_mask = None
+    if is_rank0():
+        full_sequences, full_attention, full_response_mask = generate_local_sequences(
+            model=model,
+            base_model=base_model,
+            student_rollout=student_rollout,
+            batch=batch,
+            non_tensor=non_tensor,
+            mm_inputs=mm_inputs,
+            position_ids_cpu=position_ids_cpu,
+            row_start=group_start,
+            row_end=group_end,
+            prompt_width=prompt_width,
+            response_width=response_width,
+            tokenizer=tokenizer,
+            device=device,
+            image_token_id=image_token_id,
+            video_token_id=video_token_id,
+            args=args,
+        )
+    seq_len = prompt_width + response_width
+    local_sequences_cpu = scatter_tensor_from_rank0(
+        full_sequences,
+        local_shape=(local_rows, seq_len),
+        dtype=torch.long,
+        device=device,
+        world_size=world_size,
+    )
+    local_attention_cpu = scatter_tensor_from_rank0(
+        full_attention,
+        local_shape=(local_rows, seq_len),
+        dtype=torch.long,
+        device=device,
+        world_size=world_size,
+    )
+    local_response_mask_cpu = scatter_tensor_from_rank0(
+        full_response_mask,
+        local_shape=(local_rows, response_width),
+        dtype=torch.long,
+        device=device,
+        world_size=world_size,
+    )
+    rollout_sec = time.time() - rollout_start
+    metrics = {
+        "student_vllm_sync_sec": float(sync_sec),
+        "student_vllm_rollout_sec": float(rollout_sec),
+        "student_vllm_weight_count": int(sync_info.get("weight_count", 0)) if is_rank0() else 0,
+        "student_vllm_sync_sender_sec": float(sync_info.get("sender_sec", 0.0)) if is_rank0() else 0.0,
+        "student_vllm_sync_path": str(sync_info.get("path", "")) if is_rank0() else "",
+    }
+    return local_sequences_cpu, local_attention_cpu, local_response_mask_cpu, metrics
 
 
 def gather_local_mm(
@@ -534,12 +666,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--response-width", type=int, default=512)
     parser.add_argument(
         "--rollout-backend",
-        choices=("manual", "manual_cache", "hf_generate", "vllm_single"),
+        choices=("manual", "manual_cache", "hf_generate", "vllm_single", "vllm_ipc"),
         default="manual",
         help=(
             "manual recomputes the full sequence every token; manual_cache uses FSDP forward with KV cache; "
             "hf_generate is kept as a compatibility alias for manual_cache; "
-            "vllm_single uses a single-process student vLLM rollout and syncs from the HF model before each update."
+            "vllm_single uses a single-process student vLLM rollout and syncs from the HF model before each update; "
+            "vllm_ipc uses rank0 student vLLM rollout with VERL bucketed IPC weight sync."
         ),
     )
     parser.add_argument("--rollout-do-sample", action=argparse.BooleanOptionalAction, default=True)
@@ -552,6 +685,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--student-vllm-max-num-batched-tokens", type=int, default=None)
     parser.add_argument("--student-vllm-max-num-seqs", type=int, default=None)
     parser.add_argument("--student-vllm-enforce-eager", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--student-vllm-ipc-bucket-mb", type=int, default=512)
+    parser.add_argument("--student-vllm-ipc-use-shm", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--student-vllm-ipc-timeout-sec", type=float, default=900.0)
+    parser.add_argument("--student-vllm-sync-dtype", choices=("none", "fp32", "bf16", "fp16"), default="bf16")
     parser.add_argument("--generate-amp-dtype", choices=("none", "bf16", "fp16"), default="bf16")
     parser.add_argument("--train-amp-dtype", choices=("none", "bf16", "fp16"), default="bf16")
     parser.add_argument("--generate-position-ids-mode", choices=("none",), default="none")
@@ -593,6 +730,8 @@ def main() -> None:
         )
     if args.rollout_backend == "vllm_single" and world_size != 1:
         raise ValueError("rollout_backend=vllm_single is only for a single training process. Use nproc_per_node=1.")
+    if args.rollout_backend == "vllm_ipc" and world_size < 2:
+        raise ValueError("rollout_backend=vllm_ipc is intended for multi-rank FSDP. Use vllm_single for world_size=1.")
 
     (
         _cl_sft_args,
@@ -644,10 +783,10 @@ def main() -> None:
         topk=args.topk,
     )
     student_rollout = None
-    if args.rollout_backend == "vllm_single":
+    if args.rollout_backend in {"vllm_single", "vllm_ipc"} and is_rank0():
         os.environ.setdefault("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
         if model_args.model_name_or_path is None:
-            raise ValueError("rollout_backend=vllm_single requires model.model_name_or_path in the config.")
+            raise ValueError(f"rollout_backend={args.rollout_backend} requires model.model_name_or_path in the config.")
         student_rollout = VLLMStudentRollout(
             model_path=model_args.model_name_or_path,
             tokenizer=tokenizer,
@@ -676,10 +815,16 @@ def main() -> None:
     rank_print(f"epochs={args.epochs}")
     rank_print(f"response_width={args.response_width}")
     rank_print(f"rollout_backend={args.rollout_backend}")
-    if args.rollout_backend == "vllm_single":
+    if args.rollout_backend in {"vllm_single", "vllm_ipc"}:
         rank_print(f"student_vllm_dtype={args.student_vllm_dtype}")
         rank_print(f"student_vllm_gpu_memory_utilization={args.student_vllm_gpu_memory_utilization}")
         rank_print(f"student_vllm_max_model_len={args.student_vllm_max_model_len}")
+        if args.rollout_backend == "vllm_ipc":
+            rank_print("student_vllm_rank0_colocated=True")
+            rank_print("student_vllm_rank0_colocated_warning=A100_40GB_may_OOM; use smoke max-updates first")
+            rank_print(f"student_vllm_ipc_bucket_mb={args.student_vllm_ipc_bucket_mb}")
+            rank_print(f"student_vllm_ipc_use_shm={args.student_vllm_ipc_use_shm}")
+            rank_print(f"student_vllm_sync_dtype={args.student_vllm_sync_dtype}")
     rank_print(f"teacher={args.teacher_host}:{args.teacher_port}")
     rank_print(f"generate_amp_dtype={args.generate_amp_dtype}")
     rank_print(f"train_amp_dtype={args.train_amp_dtype}")
@@ -773,28 +918,55 @@ def main() -> None:
                     row_end = group_start + local_offset_end
                     update_step += 1
 
-                    if student_rollout is not None:
+                    rollout_metrics: dict[str, float | int | str] = {}
+                    if args.rollout_backend == "vllm_single" and student_rollout is not None:
                         student_rollout.sync_from_hf_model(base_model)
                         sync_cuda(device, f"student vLLM sync step {update_step}")
 
-                    local_sequences_cpu, local_attention_cpu, local_response_mask_cpu = generate_local_sequences(
-                        model=model,
-                        base_model=base_model,
-                        student_rollout=student_rollout,
-                        batch=batch,
-                        non_tensor=non_tensor,
-                        mm_inputs=mm_inputs,
-                        position_ids_cpu=position_ids_cpu,
-                        row_start=row_start,
-                        row_end=row_end,
-                        prompt_width=prompt_width,
-                        response_width=args.response_width,
-                        tokenizer=tokenizer,
-                        device=device,
-                        image_token_id=image_token_id,
-                        video_token_id=video_token_id,
-                        args=args,
-                    )
+                    if args.rollout_backend == "vllm_ipc":
+                        if is_rank0() and student_rollout is None:
+                            raise RuntimeError("rank0 student_rollout is required for rollout_backend=vllm_ipc.")
+                        local_sequences_cpu, local_attention_cpu, local_response_mask_cpu, rollout_metrics = (
+                            generate_vllm_ipc_global_sequences(
+                                model=model,
+                                base_model=base_model,
+                                student_rollout=student_rollout,  # type: ignore[arg-type]
+                                batch=batch,
+                                non_tensor=non_tensor,
+                                mm_inputs=mm_inputs,
+                                position_ids_cpu=position_ids_cpu,
+                                group_start=group_start,
+                                group_end=group_end,
+                                local_rows=row_end - row_start,
+                                prompt_width=prompt_width,
+                                response_width=args.response_width,
+                                tokenizer=tokenizer,
+                                device=device,
+                                image_token_id=image_token_id,
+                                video_token_id=video_token_id,
+                                args=args,
+                                world_size=world_size,
+                            )
+                        )
+                    else:
+                        local_sequences_cpu, local_attention_cpu, local_response_mask_cpu = generate_local_sequences(
+                            model=model,
+                            base_model=base_model,
+                            student_rollout=student_rollout,
+                            batch=batch,
+                            non_tensor=non_tensor,
+                            mm_inputs=mm_inputs,
+                            position_ids_cpu=position_ids_cpu,
+                            row_start=row_start,
+                            row_end=row_end,
+                            prompt_width=prompt_width,
+                            response_width=args.response_width,
+                            tokenizer=tokenizer,
+                            device=device,
+                            image_token_id=image_token_id,
+                            video_token_id=video_token_id,
+                            args=args,
+                        )
                     seq_len = int(local_sequences_cpu.shape[1])
                     local_sequences = local_sequences_cpu.to(device)
                     local_attention = local_attention_cpu.to(device)
@@ -1016,9 +1188,11 @@ def main() -> None:
                             "update_param": format_update_probe_names(update_probes),
                             "response_len_mean": float(sum(flat_lengths) / max(len(flat_lengths), 1)),
                             "response_len_max": float(max(flat_lengths) if flat_lengths else 0.0),
+                            "rollout_backend": args.rollout_backend,
                             "generate_amp_dtype": args.generate_amp_dtype,
                             "train_amp_dtype": args.train_amp_dtype,
                         }
+                        record.update(rollout_metrics)
                         record.update(update_stats)
                         message = (
                             " | ".join(

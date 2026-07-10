@@ -1,8 +1,21 @@
 import os
+import asyncio
+import functools
+import sys
+import threading
+import time
+import uuid
 import warnings
+from pathlib import Path
 from typing import Any
 
 import torch
+
+ROOT = Path(__file__).resolve().parents[2]
+REPO_ROOT = ROOT.parent
+VERL_ROOT = REPO_ROOT / "verl_new"
+if str(VERL_ROOT) not in sys.path:
+    sys.path.insert(0, str(VERL_ROOT))
 
 
 def is_rank_zero_process() -> bool:
@@ -18,6 +31,97 @@ def resolve_cuda_device(device: str | None) -> str | None:
             return None
         return f"cuda:{int(os.environ.get('LOCAL_RANK', '0'))}"
     return device
+
+
+def _load_weights_into_model(model: Any, weights: list[tuple[str, torch.Tensor]]) -> dict[str, Any]:
+    named_buffers = dict(model.named_buffers())
+    param_updates = []
+    buffer_updates = []
+    for name, tensor in weights:
+        if name in named_buffers:
+            buffer_updates.append((name, tensor))
+        else:
+            param_updates.append((name, tensor))
+
+    result = model.load_weights(param_updates) if param_updates else []
+    loaded_buffers = 0
+    for name, tensor in buffer_updates:
+        if name not in named_buffers:
+            continue
+        target = named_buffers[name]
+        if tuple(target.shape) != tuple(tensor.shape):
+            raise ValueError(f"Buffer shape mismatch for {name}: expected {tuple(target.shape)}, got {tuple(tensor.shape)}")
+        target.copy_(tensor.to(device=target.device, dtype=target.dtype), non_blocking=False)
+        loaded_buffers += 1
+
+    return {
+        "load_weights": result,
+        "param_updates": len(param_updates),
+        "buffer_updates": len(buffer_updates),
+        "loaded_buffers": loaded_buffers,
+    }
+
+
+def _infer_model_device(model: torch.nn.Module) -> torch.device:
+    for tensor in list(model.parameters()) + list(model.buffers()):
+        return tensor.device
+    if torch.cuda.is_available():
+        return torch.device("cuda", torch.cuda.current_device())
+    return torch.device("cpu")
+
+
+def _ipc_load_weights_on_worker(model: Any, zmq_handle: str, use_shm: bool) -> str:
+    from verl.workers.rollout.vllm_rollout.bucketed_weight_transfer import BucketedWeightReceiver
+
+    device = _infer_model_device(model)
+    bucket_summaries: list[dict[str, Any]] = []
+    receiver = BucketedWeightReceiver(
+        zmq_handle=zmq_handle,
+        device=device,
+        use_shm=use_shm,
+    )
+
+    def on_bucket_received(weights: list[tuple[str, torch.Tensor]]) -> None:
+        summary = _load_weights_into_model(model, weights)
+        bucket_summaries.append(
+            {
+                "bucket_idx": len(bucket_summaries),
+                "tensor_count": len(weights),
+                "param_updates": summary["param_updates"],
+                "buffer_updates": summary["buffer_updates"],
+                "loaded_buffers": summary["loaded_buffers"],
+            }
+        )
+
+    receiver.receive_weights(on_bucket_received=on_bucket_received)
+    return repr(
+        {
+            "device": str(device),
+            "use_shm": use_shm,
+            "bucket_count": len(bucket_summaries),
+            "tensor_count": sum(item["tensor_count"] for item in bucket_summaries),
+            "param_updates": sum(item["param_updates"] for item in bucket_summaries),
+            "buffer_updates": sum(item["buffer_updates"] for item in bucket_summaries),
+            "loaded_buffers": sum(item["loaded_buffers"] for item in bucket_summaries),
+        }
+    )
+
+
+def _send_weights_via_ipc(
+    weights: list[tuple[str, torch.Tensor]],
+    *,
+    zmq_handle: str,
+    bucket_size_mb: int,
+    use_shm: bool,
+) -> None:
+    from verl.workers.rollout.vllm_rollout.bucketed_weight_transfer import BucketedWeightSender
+
+    sender = BucketedWeightSender(
+        zmq_handle=zmq_handle,
+        bucket_size_mb=bucket_size_mb,
+        use_shm=use_shm,
+    )
+    asyncio.run(sender.async_send_weights(iter(weights)))
 
 
 class VLLMStudentRollout:
@@ -62,6 +166,7 @@ class VLLMStudentRollout:
                 print(f"OPD requested student rollout CUDA_VISIBLE_DEVICES={visible_devices}")
 
         try:
+            os.environ.setdefault("VLLM_ALLOW_INSECURE_SERIALIZATION", "1")
             from vllm import LLM, SamplingParams
         except ImportError as exc:
             raise ImportError("method.rollout_backend='vllm' requires the vllm package.") from exc
@@ -271,6 +376,106 @@ class VLLMStudentRollout:
 
         if os.getenv("CLIGHT_OPD_VLLM_DEBUG") == "1" and is_rank_zero_process():
             print(f"OPD student vLLM synced {len(weights)} tensors from HF student.")
+
+    def sync_from_weight_items_ipc(
+        self,
+        weights: list[tuple[str, torch.Tensor]],
+        *,
+        bucket_size_mb: int = 512,
+        use_shm: bool = False,
+        timeout_sec: float = 600.0,
+        sync_dtype: torch.dtype | None = None,
+    ) -> dict[str, Any]:
+        if not weights:
+            return {
+                "weight_count": 0,
+                "sender_sec": 0.0,
+                "total_sec": 0.0,
+                "path": "skipped_empty",
+            }
+
+        prepared_weights = []
+        for name, tensor in weights:
+            if not torch.is_tensor(tensor):
+                continue
+            value = tensor.detach()
+            if sync_dtype is not None and value.is_floating_point():
+                value = value.to(dtype=sync_dtype)
+            if use_shm:
+                value = value.cpu()
+            elif not value.is_cuda:
+                value = value.cuda()
+            prepared_weights.append((name, value.contiguous()))
+
+        apply_model = getattr(self.llm, "apply_model", None)
+        owner_name = "llm"
+        owner = self.llm
+        if not callable(apply_model):
+            engine = getattr(self.llm, "llm_engine", None)
+            apply_model = getattr(engine, "apply_model", None)
+            owner_name = "llm.llm_engine"
+            owner = engine
+        if not callable(apply_model):
+            raise RuntimeError("Could not find llm.apply_model or llm.llm_engine.apply_model for IPC sync.")
+
+        zmq_handle = f"ipc:///tmp/clight-student-vllm-ipc-{os.getpid()}-{uuid.uuid4().hex}.sock"
+        result_box: dict[str, Any] = {}
+
+        def receiver_target() -> None:
+            try:
+                result_box["result"] = apply_model(
+                    functools.partial(_ipc_load_weights_on_worker, zmq_handle=zmq_handle, use_shm=use_shm)
+                )
+                result_box["ok"] = True
+            except Exception as exc:
+                result_box["ok"] = False
+                result_box["error"] = f"{type(exc).__name__}: {exc}"
+
+        total_start = time.time()
+        receiver_thread = threading.Thread(
+            target=receiver_target,
+            name="clight-student-vllm-ipc-receiver",
+            daemon=True,
+        )
+        receiver_thread.start()
+        time.sleep(0.5)
+        if result_box.get("ok") is False:
+            raise RuntimeError(f"Student vLLM IPC receiver failed before send: {result_box.get('error')}")
+
+        sender_start = time.time()
+        _send_weights_via_ipc(
+            prepared_weights,
+            zmq_handle=zmq_handle,
+            bucket_size_mb=bucket_size_mb,
+            use_shm=use_shm,
+        )
+        sender_sec = time.time() - sender_start
+
+        receiver_thread.join(timeout=timeout_sec)
+        if receiver_thread.is_alive():
+            raise TimeoutError(f"Student vLLM IPC receiver timed out after {timeout_sec}s.")
+        if not result_box.get("ok"):
+            raise RuntimeError(f"Student vLLM IPC receiver failed: {result_box.get('error')}")
+
+        total_sec = time.time() - total_start
+        if os.getenv("CLIGHT_OPD_VLLM_DEBUG") == "1" and is_rank_zero_process():
+            print(
+                "OPD student vLLM IPC synced:",
+                f"weights={len(prepared_weights)}",
+                f"bucket_size_mb={bucket_size_mb}",
+                f"use_shm={use_shm}",
+                f"sender_sec={sender_sec:.3f}",
+                f"total_sec={total_sec:.3f}",
+                f"path={owner_name}.apply_model_ipc",
+            )
+
+        return {
+            "weight_count": len(prepared_weights),
+            "sender_sec": sender_sec,
+            "total_sec": total_sec,
+            "path": f"{owner_name}.apply_model_ipc",
+            "receiver_result": result_box.get("result"),
+        }
 
     def _find_vllm_model_with_load_weights(self) -> Any:
         candidates = [
