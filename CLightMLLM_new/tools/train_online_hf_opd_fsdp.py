@@ -1,4 +1,5 @@
 import argparse
+import glob
 import json
 import os
 import re
@@ -21,6 +22,11 @@ from torch.distributed.fsdp import (
     StateDictType,
 )
 from torch.distributed.fsdp.wrap import size_based_auto_wrap_policy
+
+try:
+    from datasets import load_dataset
+except Exception:  # pragma: no cover - parquet source is optional.
+    load_dataset = None
 
 try:
     from tqdm.auto import tqdm
@@ -62,6 +68,7 @@ from replay_verl_opd_trace_fsdp import (  # noqa: E402
     select_fsdp_update_probes,
     split_contiguous_rows,
 )
+from src.data import IMAGE_PLACEHOLDER, TemplateFactory, VLCollator  # noqa: E402
 from src.method.vllm_teacher_client import RemoteTeacherScorer  # noqa: E402
 from src.method.vllm_student import VLLMStudentRollout  # noqa: E402
 from src.model import ModelTuner, load_processor_and_tokenizer, load_vision_language_model  # noqa: E402
@@ -98,6 +105,202 @@ def trace_sort_key(path: str) -> tuple[int, int, int, str]:
         dump_idx, step_idx, chunk_idx = (int(value) for value in match.groups())
         return dump_idx, step_idx, chunk_idx, name
     return 10**12, 10**12, 10**12, name
+
+
+def parquet_sort_key(path: str) -> tuple[str, str]:
+    return str(Path(path).parent), Path(path).name
+
+
+def expand_parquet_paths(paths: list[str]) -> list[str]:
+    expanded: list[str] = []
+    for item in paths:
+        path = Path(os.path.expanduser(item))
+        if any(ch in str(path) for ch in "*?[]"):
+            expanded.extend(str(Path(p)) for p in sorted(glob.glob(str(path))))
+        elif path.is_dir():
+            expanded.extend(str(p) for p in sorted(path.glob("*.parquet")))
+        elif path.is_file() and path.suffix == ".parquet":
+            expanded.append(str(path))
+        else:
+            matches = expand_paths([str(path)])
+            expanded.extend(match for match in matches if match.endswith(".parquet"))
+    expanded = sorted(dict.fromkeys(expanded), key=parquet_sort_key)
+    if not expanded:
+        raise FileNotFoundError(f"No parquet files matched: {paths}")
+    return expanded
+
+
+def normalize_geo3k_prompt(raw_prompt: Any, images: list[Any]) -> list[dict[str, str]]:
+    if isinstance(raw_prompt, str):
+        prompt = [{"role": "user", "content": raw_prompt}]
+    elif isinstance(raw_prompt, list):
+        prompt = []
+        for turn in raw_prompt:
+            if not isinstance(turn, dict):
+                continue
+            role = str(turn.get("role", "user"))
+            content = str(turn.get("content", ""))
+            prompt.append({"role": role, "content": content})
+    else:
+        prompt = [{"role": "user", "content": str(raw_prompt)}]
+
+    if not prompt:
+        prompt = [{"role": "user", "content": ""}]
+
+    image_count = len(images)
+    placeholder_count = sum(turn["content"].count(IMAGE_PLACEHOLDER) for turn in prompt)
+    if image_count > placeholder_count:
+        missing = image_count - placeholder_count
+        prompt[0]["content"] = f"{IMAGE_PLACEHOLDER * missing}\n{prompt[0]['content']}"
+    return prompt
+
+
+def normalize_geo3k_images(value: Any) -> list[Any]:
+    if value is None:
+        return []
+    if isinstance(value, list):
+        return [image for image in value if image is not None]
+    if isinstance(value, tuple):
+        return [image for image in value if image is not None]
+    return [value]
+
+
+def encode_prompt_ids(
+    *,
+    prompt: list[dict[str, str]],
+    images: list[Any],
+    collator: VLCollator,
+) -> list[int]:
+    messages = collator.template.mm_plugin.process_messages(prompt, images, collator.processor)
+    encoded = collator.template.encode_messages(collator.tokenizer, messages, system=None)
+    return [token_id for turn_ids in encoded for token_id in turn_ids]
+
+
+def build_geo3k_feature(
+    row: dict[str, Any],
+    row_index: int,
+    collator: VLCollator,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    images = normalize_geo3k_images(row.get("images") or row.get("image"))
+    prompt = normalize_geo3k_prompt(row.get("prompt", row.get("problem", "")), images)
+    prompt_ids = encode_prompt_ids(prompt=prompt, images=images, collator=collator)
+    reward_model = row.get("reward_model")
+    extra_info = row.get("extra_info")
+    if not isinstance(extra_info, dict):
+        extra_info = {"index": row_index}
+    extra_info = dict(extra_info)
+    extra_info.setdefault("index", row_index)
+    feature = {
+        "input_ids": prompt_ids,
+        "attention_mask": [1] * len(prompt_ids),
+        "labels": [-100] * len(prompt_ids),
+        "images": images,
+        "prompt_input_ids": prompt_ids,
+        "prompt_attention_mask": [1] * len(prompt_ids),
+        "reference_text": str(extra_info.get("answer", "")),
+    }
+    metadata = {
+        "data_source": row.get("data_source", "geo3k"),
+        "reward_model": reward_model if isinstance(reward_model, dict) else {},
+        "extra_info": extra_info,
+        "raw_prompt": prompt,
+        "ability": row.get("ability", "geometry"),
+    }
+    return feature, metadata
+
+
+def split_collated_mm_inputs(collated: dict[str, Any], images_per_sample: list[list[Any]]) -> list[dict[str, Any] | None]:
+    image_grid_thw = collated.get("image_grid_thw")
+    pixel_values = collated.get("pixel_values")
+    if image_grid_thw is None:
+        return [None for _ in images_per_sample]
+    if not torch.is_tensor(image_grid_thw):
+        image_grid_thw = torch.as_tensor(image_grid_thw)
+    if pixel_values is not None and not torch.is_tensor(pixel_values):
+        pixel_values = torch.as_tensor(pixel_values)
+
+    per_sample: list[dict[str, Any] | None] = []
+    grid_offset = 0
+    pixel_offset = 0
+    for images in images_per_sample:
+        image_count = len(images)
+        if image_count <= 0:
+            per_sample.append(None)
+            continue
+
+        sample_grids = image_grid_thw[grid_offset : grid_offset + image_count].detach().cpu()
+        grid_offset += image_count
+        item: dict[str, Any] = {"image_grid_thw": sample_grids}
+        if pixel_values is not None:
+            patch_count = int(sample_grids.long().prod(dim=1).sum().item())
+            item["pixel_values"] = pixel_values[pixel_offset : pixel_offset + patch_count].detach().cpu()
+            pixel_offset += patch_count
+        if "images_seqlens" in collated and collated["images_seqlens"] is not None:
+            images_seqlens = collated["images_seqlens"]
+            if torch.is_tensor(images_seqlens):
+                item["images_seqlens"] = images_seqlens[grid_offset - image_count : grid_offset].detach().cpu()
+        per_sample.append(item)
+    return per_sample
+
+
+def features_to_trace_payload(
+    *,
+    features: list[dict[str, Any]],
+    metadata: list[dict[str, Any]],
+    collator: VLCollator,
+) -> dict[str, Any]:
+    collated = collator(features)
+    prompts = collated["prompt_input_ids"].long()
+    prompt_attention = collated["prompt_attention_mask"].long()
+    batch = {
+        "prompts": prompts,
+        "attention_mask": prompt_attention,
+    }
+    if "position_ids" in collated:
+        position_ids = collated["position_ids"]
+        if torch.is_tensor(position_ids):
+            batch["position_ids"] = position_ids[..., : prompts.shape[1]].detach().cpu()
+
+    vllm_images = collated.get("vllm_images") or [[] for _ in features]
+    multi_modal_inputs = split_collated_mm_inputs(collated, vllm_images)
+    multi_modal_data = [{"images": images, "image": images} for images in vllm_images]
+
+    non_tensor = {
+        "data_source": [item["data_source"] for item in metadata],
+        "reward_model": [item["reward_model"] for item in metadata],
+        "extra_info": [item["extra_info"] for item in metadata],
+        "raw_prompt": [item["raw_prompt"] for item in metadata],
+        "ability": [item["ability"] for item in metadata],
+        "multi_modal_inputs": multi_modal_inputs,
+        "multi_modal_data": multi_modal_data,
+        "vllm_images": vllm_images,
+        "mm_processor_kwargs": [None for _ in features],
+    }
+    return {"batch": batch, "non_tensor_batch": non_tensor}
+
+
+def iter_geo3k_parquet_payloads(
+    *,
+    paths: list[str],
+    samples_per_update: int,
+    collator: VLCollator,
+    max_rows: int = 0,
+) -> Any:
+    if load_dataset is None:
+        raise ImportError("Geo3K parquet data source requires the `datasets` package.")
+    dataset = load_dataset("parquet", data_files=paths, split="train")
+    total = len(dataset) if max_rows <= 0 else min(len(dataset), max_rows)
+    features: list[dict[str, Any]] = []
+    metadata: list[dict[str, Any]] = []
+    for row_index in range(total):
+        row = dataset[int(row_index)]
+        feature, item_metadata = build_geo3k_feature(row, row_index, collator)
+        features.append(feature)
+        metadata.append(item_metadata)
+        if len(features) == samples_per_update:
+            yield features_to_trace_payload(features=features, metadata=metadata, collator=collator)
+            features = []
+            metadata = []
 
 
 def row_value(values: Any, row: int) -> Any:
@@ -654,7 +857,13 @@ def parse_args() -> argparse.Namespace:
         )
     )
     parser.add_argument("--config", required=True)
-    parser.add_argument("traces", nargs="+", help="VERL trace dump file(s) or glob pattern(s).")
+    parser.add_argument(
+        "--data-source",
+        choices=("trace", "geo3k_parquet"),
+        default="trace",
+        help="Input format. trace consumes VERL .pt dumps; geo3k_parquet consumes Geo3K/VERL-style parquet rows.",
+    )
+    parser.add_argument("traces", nargs="+", help="Input file(s), directory, or glob pattern(s).")
     parser.add_argument("--teacher-host", default="127.0.0.1")
     parser.add_argument("--teacher-port", type=int, default=29577)
     parser.add_argument("--teacher-timeout", type=float, default=1800.0)
@@ -724,6 +933,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--update-probe-max-params", type=int, default=1)
     parser.add_argument("--dump-traces", action="store_true")
     parser.add_argument("--dump-trace-dir", default=None)
+    parser.add_argument("--parquet-max-rows", type=int, default=0, help="Limit Geo3K parquet rows for smoke tests.")
     return parser.parse_args()
 
 
@@ -812,9 +1022,12 @@ def main() -> None:
     if args.rollout_backend == "vllm_ipc" and world_size < 2:
         raise ValueError("rollout_backend=vllm_ipc is intended for multi-rank FSDP. Use vllm_single for world_size=1.")
 
-    paths = sorted(expand_paths(args.traces), key=trace_sort_key)
-    if not paths:
-        raise FileNotFoundError(f"No trace files matched: {args.traces}")
+    if args.data_source == "trace":
+        paths = sorted(expand_paths(args.traces), key=trace_sort_key)
+        if not paths:
+            raise FileNotFoundError(f"No trace files matched: {args.traces}")
+    else:
+        paths = expand_parquet_paths(args.traces)
 
     base_model, processor, tokenizer = load_vision_language_model(model_args, data_args.template)
     base_model = ModelTuner(tuning_args).apply(base_model)
@@ -845,6 +1058,17 @@ def main() -> None:
         timeout=args.teacher_timeout,
         topk=args.topk,
     )
+    parquet_collator = None
+    if args.data_source == "geo3k_parquet":
+        template = TemplateFactory.from_args(tokenizer, data_args)
+        parquet_collator = VLCollator(
+            tokenizer=tokenizer,
+            model=base_model,
+            template=template,
+            processor=processor,
+            torch_dtype=torch.bfloat16,
+            padding=True,
+        )
     if args.rollout_backend in {"vllm_single", "vllm_ipc"} and is_rank0():
         if student_rollout is None:
             student_rollout = build_student_vllm_rollout(
@@ -862,7 +1086,8 @@ def main() -> None:
 
     rank_print("=== online hf opd fsdp ===")
     rank_print(f"config={args.config}")
-    rank_print(f"trace_count={len(paths)}")
+    rank_print(f"data_source={args.data_source}")
+    rank_print(f"source_count={len(paths)}")
     rank_print(f"world_size={world_size}")
     rank_print(f"local_rank={local_rank}")
     rank_print(f"samples_per_update={args.samples_per_update}")
@@ -907,7 +1132,8 @@ def main() -> None:
             {
                 "format": "clight_online_hf_opd_fsdp_config_v1",
                 "config": args.config,
-                "trace_count": len(paths),
+                "data_source": args.data_source,
+                "source_count": len(paths),
                 "world_size": world_size,
                 "samples_per_update": args.samples_per_update,
                 "epochs": args.epochs,
@@ -938,8 +1164,24 @@ def main() -> None:
 
     try:
         for epoch in range(args.epochs):
-            for path in paths:
-                payload = load_trace(path)
+            if args.data_source == "trace":
+                source_iter = ((path, load_trace(path)) for path in paths)
+            else:
+                if parquet_collator is None:
+                    raise RuntimeError("parquet_collator is required for data_source=geo3k_parquet.")
+                source_iter = (
+                    (f"geo3k_parquet_chunk{chunk_idx:06d}", payload)
+                    for chunk_idx, payload in enumerate(
+                        iter_geo3k_parquet_payloads(
+                            paths=paths,
+                            samples_per_update=args.samples_per_update,
+                            collator=parquet_collator,
+                            max_rows=args.parquet_max_rows,
+                        )
+                    )
+                )
+
+            for source_name, payload in source_iter:
                 batch = payload["batch"]
                 non_tensor = payload.get("non_tensor_batch", {})
                 mm_inputs = normalize_mm_inputs(non_tensor.get("multi_modal_inputs"))
@@ -950,7 +1192,7 @@ def main() -> None:
                 usable_rows = source_rows - (source_rows % args.samples_per_update)
                 if usable_rows <= 0:
                     raise ValueError(
-                        f"{path} has {source_rows} rows, fewer than samples_per_update={args.samples_per_update}."
+                        f"{source_name} has {source_rows} rows, fewer than samples_per_update={args.samples_per_update}."
                     )
                 groups_in_file = usable_rows // args.samples_per_update
                 if (
@@ -1206,7 +1448,7 @@ def main() -> None:
                         args=args,
                         update_step=update_step,
                         epoch=epoch,
-                        source_path=path,
+                        source_path=source_name,
                         row_start=row_start,
                         row_end=row_end,
                         local_sequences=local_sequences,
@@ -1230,7 +1472,7 @@ def main() -> None:
                             "online_update_step": update_step,
                             "replay_update_step": update_step,
                             "epoch": epoch,
-                            "source_path": path,
+                            "source_path": source_name,
                             "source_row_start": group_start,
                             "source_row_end": group_end,
                             "samples": args.samples_per_update,
@@ -1256,7 +1498,7 @@ def main() -> None:
                                 [
                                     f"step={update_step}",
                                     f"epoch={epoch}",
-                                    f"path={path}",
+                                    f"path={source_name}",
                                     f"rows={group_start}:{group_end}",
                                     f"samples={args.samples_per_update}",
                                     f"tokens={record['tokens']}",
