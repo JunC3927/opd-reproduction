@@ -17,7 +17,6 @@ from torch.distributed.fsdp import (
     ShardingStrategy,
 )
 from torch.distributed.fsdp.wrap import size_based_auto_wrap_policy
-from transformers import GenerationConfig
 
 ROOT = Path(__file__).resolve().parents[1]
 TOOLS = Path(__file__).resolve().parent
@@ -131,33 +130,6 @@ def mm_kwargs_from_non_tensor(non_tensor: dict[str, Any], row: int) -> dict[str,
     return value if isinstance(value, dict) else None
 
 
-def fsdp_generate_context(model: FSDP):
-    modules = []
-    seen: set[int] = set()
-    for module in model.modules():
-        if isinstance(module, FSDP) and id(module) not in seen:
-            modules.append(module)
-            seen.add(id(module))
-    if not modules:
-        return nullcontext()
-
-    class _Context:
-        def __enter__(self):
-            self.stack = []
-            for module in modules:
-                ctx = FSDP.summon_full_params(module, writeback=False, recurse=False)
-                ctx.__enter__()
-                self.stack.append(ctx)
-            return None
-
-        def __exit__(self, exc_type, exc, tb):
-            while self.stack:
-                self.stack.pop().__exit__(exc_type, exc, tb)
-            return False
-
-    return _Context()
-
-
 def autocast_context(dtype: str):
     if dtype == "bf16":
         return torch.autocast(device_type="cuda", dtype=torch.bfloat16)
@@ -166,18 +138,34 @@ def autocast_context(dtype: str):
     return nullcontext()
 
 
-def generation_config(args: argparse.Namespace, tokenizer: Any) -> GenerationConfig:
-    kwargs = {
-        "max_new_tokens": args.response_width,
-        "do_sample": args.rollout_do_sample,
-        "temperature": args.rollout_temperature,
-        "top_p": args.rollout_top_p,
-        "pad_token_id": tokenizer.pad_token_id,
-        "eos_token_id": tokenizer.eos_token_id,
-    }
-    if args.rollout_top_k is not None and args.rollout_top_k >= 0:
-        kwargs["top_k"] = args.rollout_top_k
-    return GenerationConfig(**kwargs)
+def sample_next_token(logits: torch.Tensor, args: argparse.Namespace) -> torch.Tensor:
+    logits = logits.float()
+    if not args.rollout_do_sample:
+        return logits.argmax(dim=-1)
+
+    temperature = max(float(args.rollout_temperature), 1e-6)
+    logits = logits / temperature
+
+    top_k = int(args.rollout_top_k) if args.rollout_top_k is not None else -1
+    if top_k > 0 and top_k < logits.shape[-1]:
+        values, _indices = torch.topk(logits, k=top_k, dim=-1)
+        cutoff = values[:, -1].unsqueeze(-1)
+        logits = logits.masked_fill(logits < cutoff, float("-inf"))
+
+    top_p = float(args.rollout_top_p)
+    if 0.0 < top_p < 1.0:
+        sorted_logits, sorted_indices = torch.sort(logits, descending=True, dim=-1)
+        sorted_probs = torch.softmax(sorted_logits, dim=-1)
+        cumulative = sorted_probs.cumsum(dim=-1)
+        remove = cumulative > top_p
+        remove[:, 1:] = remove[:, :-1].clone()
+        remove[:, 0] = False
+        sorted_logits = sorted_logits.masked_fill(remove, float("-inf"))
+        logits = torch.full_like(logits, float("-inf"))
+        logits.scatter_(dim=-1, index=sorted_indices, src=sorted_logits)
+
+    probs = torch.softmax(logits, dim=-1)
+    return torch.multinomial(probs, num_samples=1).squeeze(-1)
 
 
 def completion_mask(responses: torch.Tensor, *, pad_token_id: int, eos_token_id: int | None) -> torch.Tensor:
@@ -190,35 +178,6 @@ def completion_mask(responses: torch.Tensor, *, pad_token_id: int, eos_token_id:
         )
         mask = mask & before_or_at_first_eos
     return mask.long()
-
-
-def pad_generated_responses(
-    sequences: torch.Tensor,
-    *,
-    prompt_width: int,
-    response_width: int,
-    pad_token_id: int,
-    eos_token_id: int | None,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    if sequences.shape[1] < prompt_width:
-        raise RuntimeError(
-            f"Generated sequence shorter than prompt_width: {sequences.shape[1]} < {prompt_width}"
-        )
-    generated = sequences[:, prompt_width : prompt_width + response_width].detach().cpu()
-    responses = torch.full(
-        (sequences.shape[0], response_width),
-        int(pad_token_id),
-        dtype=sequences.dtype,
-    )
-    width = min(response_width, generated.shape[1])
-    if width > 0:
-        responses[:, :width] = generated[:, :width]
-    response_mask = completion_mask(
-        responses,
-        pad_token_id=int(pad_token_id),
-        eos_token_id=None if eos_token_id is None else int(eos_token_id),
-    )
-    return responses.long(), response_mask.long()
 
 
 def generate_local_sequences(
@@ -237,17 +196,8 @@ def generate_local_sequences(
     device: torch.device,
     args: argparse.Namespace,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    prompts = batch["prompts"][row_start:row_end].to(device)
-    prompt_attention_mask = batch["attention_mask"][row_start:row_end, :prompt_width].to(device)
-    forward_kwargs: dict[str, Any] = {
-        "input_ids": prompts,
-        "attention_mask": prompt_attention_mask,
-        "use_cache": True,
-    }
-    forward_kwargs.update(build_mm_kwargs(mm_inputs, row_start, row_end, device))
-    # Some Qwen3-VL generation implementations reject mm_token_type_ids in
-    # GenerationMixin validation. Keep generation on the official HF path and let
-    # the model derive multimodal token types from input_ids/image_grid_thw.
+    sequences = batch["prompts"][row_start:row_end].to(device).long()
+    attention_mask = batch["attention_mask"][row_start:row_end, :prompt_width].to(device).long()
     if position_ids_cpu is not None and args.generate_position_ids_mode != "none":
         raise NotImplementedError(
             "Non-default generate_position_ids_mode is intentionally unsupported for now. "
@@ -256,24 +206,55 @@ def generate_local_sequences(
 
     was_training = model.training
     model.eval()
-    with torch.no_grad(), fsdp_generate_context(model), autocast_context(args.generate_amp_dtype):
-        outputs = model.module.generate(
-            **forward_kwargs,
-            generation_config=generation_config(args, tokenizer),
-        )
+    responses = torch.full(
+        (row_end - row_start, response_width),
+        int(tokenizer.pad_token_id),
+        dtype=torch.long,
+        device=device,
+    )
+    finished = torch.zeros(row_end - row_start, dtype=torch.bool, device=device)
+    eos_token_id = getattr(tokenizer, "eos_token_id", None)
+    pad_token_id = int(tokenizer.pad_token_id)
+
+    with torch.no_grad():
+        for step in range(response_width):
+            forward_kwargs: dict[str, Any] = {
+                "input_ids": sequences,
+                "attention_mask": attention_mask,
+                "use_cache": False,
+            }
+            forward_kwargs.update(build_mm_kwargs(mm_inputs, row_start, row_end, device))
+            mm_token_type_ids = build_mm_token_type_ids(base_model, sequences)
+            if mm_token_type_ids is not None and "image_grid_thw" in forward_kwargs:
+                forward_kwargs["mm_token_type_ids"] = mm_token_type_ids
+
+            with autocast_context(args.generate_amp_dtype):
+                outputs = model(**forward_kwargs)
+            next_token = sample_next_token(outputs.logits[:, -1, :], args).long()
+            next_token = torch.where(finished, torch.full_like(next_token, pad_token_id), next_token)
+            responses[:, step] = next_token
+
+            token_attention = (~finished).long()
+            sequences = torch.cat([sequences, next_token.unsqueeze(1)], dim=1)
+            attention_mask = torch.cat([attention_mask, token_attention.unsqueeze(1)], dim=1)
+            if eos_token_id is not None:
+                finished = finished | next_token.eq(int(eos_token_id))
+            if bool(finished.all().item()):
+                break
+
     if was_training:
         model.train()
     sync_cuda(device, f"generate rows {row_start}:{row_end}")
 
-    responses, response_mask = pad_generated_responses(
-        outputs,
-        prompt_width=prompt_width,
-        response_width=response_width,
-        pad_token_id=int(tokenizer.pad_token_id),
-        eos_token_id=getattr(tokenizer, "eos_token_id", None),
+    responses_cpu = responses.detach().cpu().long()
+    response_mask = completion_mask(
+        responses_cpu,
+        pad_token_id=pad_token_id,
+        eos_token_id=None if eos_token_id is None else int(eos_token_id),
     )
-    input_ids = torch.cat([batch["prompts"][row_start:row_end].cpu().long(), responses], dim=1)
-    attention_mask = torch.cat([prompt_attention_mask.detach().cpu().long(), response_mask], dim=1)
+    input_ids = torch.cat([batch["prompts"][row_start:row_end].cpu().long(), responses_cpu], dim=1)
+    prompt_attention_mask = batch["attention_mask"][row_start:row_end, :prompt_width].cpu().long()
+    attention_mask = torch.cat([prompt_attention_mask, response_mask], dim=1)
     return input_ids, attention_mask, response_mask
 
 
