@@ -7,6 +7,7 @@ from contextlib import nullcontext
 from dataclasses import replace
 from functools import partial
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import torch
@@ -59,6 +60,7 @@ from replay_verl_opd_trace_fsdp import (  # noqa: E402
     split_contiguous_rows,
 )
 from src.method.vllm_teacher_client import RemoteTeacherScorer  # noqa: E402
+from src.method.vllm_student import VLLMStudentRollout  # noqa: E402
 from src.model import ModelTuner, load_vision_language_model  # noqa: E402
 
 
@@ -150,6 +152,26 @@ def mm_kwargs_from_non_tensor(non_tensor: dict[str, Any], row: int) -> dict[str,
     return value if isinstance(value, dict) else None
 
 
+def vllm_images_from_non_tensor(non_tensor: dict[str, Any], row: int) -> list[Any]:
+    value = row_value(non_tensor.get("vllm_images"), row)
+    mm_data = normalize_multi_modal_data(value)
+    images = images_from_mm_data(mm_data)
+    if images:
+        return images
+    return images_from_mm_data(mm_data_from_non_tensor(non_tensor, row))
+
+
+def rollout_method_args(args: argparse.Namespace) -> SimpleNamespace:
+    top_k = int(args.rollout_top_k)
+    return SimpleNamespace(
+        rollout_max_new_tokens=int(args.response_width),
+        rollout_do_sample=bool(args.rollout_do_sample),
+        rollout_temperature=float(args.rollout_temperature),
+        rollout_top_p=float(args.rollout_top_p),
+        rollout_top_k=None if top_k <= 0 else top_k,
+    )
+
+
 def autocast_context(dtype: str):
     if dtype == "bf16":
         return torch.autocast(device_type="cuda", dtype=torch.bfloat16)
@@ -223,6 +245,7 @@ def generate_local_sequences(
     *,
     model: FSDP,
     base_model: torch.nn.Module,
+    student_rollout: VLLMStudentRollout | None,
     batch: dict[str, Any],
     non_tensor: dict[str, Any],
     mm_inputs: list[Any],
@@ -233,6 +256,8 @@ def generate_local_sequences(
     response_width: int,
     tokenizer: Any,
     device: torch.device,
+    image_token_id: int | None,
+    video_token_id: int | None,
     args: argparse.Namespace,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     sequences = batch["prompts"][row_start:row_end].to(device).long()
@@ -258,6 +283,42 @@ def generate_local_sequences(
     past_key_values = None
 
     with torch.no_grad():
+        if args.rollout_backend == "vllm_single":
+            if student_rollout is None:
+                raise RuntimeError("rollout_backend=vllm_single requires a student_rollout instance.")
+            rollout_batch = {
+                "prompt_input_ids": sequences,
+                "prompt_attention_mask": attention_mask,
+                "vllm_images": [
+                    vllm_images_from_non_tensor(non_tensor, row)
+                    for row in range(row_start, row_end)
+                ],
+            }
+            generated = student_rollout.generate(
+                batch=rollout_batch,
+                method_args=rollout_method_args(args),
+                image_token_id=image_token_id,
+                video_token_id=video_token_id,
+                pad_token_id=pad_token_id,
+            )
+            responses = pad_or_truncate_responses(
+                generated[:, prompt_width:],
+                response_width=response_width,
+                pad_token_id=pad_token_id,
+            )
+            if was_training:
+                model.train()
+            responses_cpu = responses.detach().cpu().long()
+            response_mask = completion_mask(
+                responses_cpu,
+                pad_token_id=pad_token_id,
+                eos_token_id=None if eos_token_id is None else int(eos_token_id),
+            )
+            input_ids = torch.cat([batch["prompts"][row_start:row_end].cpu().long(), responses_cpu], dim=1)
+            prompt_attention_mask = batch["attention_mask"][row_start:row_end, :prompt_width].cpu().long()
+            attention_mask_cpu = torch.cat([prompt_attention_mask, response_mask], dim=1)
+            return input_ids, attention_mask_cpu, response_mask
+
         for step in range(response_width):
             if use_kv_cache and past_key_values is not None:
                 input_ids = sequences[:, -1:]
@@ -473,17 +534,24 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--response-width", type=int, default=512)
     parser.add_argument(
         "--rollout-backend",
-        choices=("manual", "manual_cache", "hf_generate"),
+        choices=("manual", "manual_cache", "hf_generate", "vllm_single"),
         default="manual",
         help=(
             "manual recomputes the full sequence every token; manual_cache uses FSDP forward with KV cache; "
-            "hf_generate is kept as a compatibility alias for manual_cache."
+            "hf_generate is kept as a compatibility alias for manual_cache; "
+            "vllm_single uses a single-process student vLLM rollout and syncs from the HF model before each update."
         ),
     )
     parser.add_argument("--rollout-do-sample", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--rollout-temperature", type=float, default=1.0)
     parser.add_argument("--rollout-top-p", type=float, default=1.0)
     parser.add_argument("--rollout-top-k", type=int, default=-1)
+    parser.add_argument("--student-vllm-dtype", default="bfloat16")
+    parser.add_argument("--student-vllm-gpu-memory-utilization", type=float, default=0.25)
+    parser.add_argument("--student-vllm-max-model-len", type=int, default=1537)
+    parser.add_argument("--student-vllm-max-num-batched-tokens", type=int, default=None)
+    parser.add_argument("--student-vllm-max-num-seqs", type=int, default=None)
+    parser.add_argument("--student-vllm-enforce-eager", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--generate-amp-dtype", choices=("none", "bf16", "fp16"), default="bf16")
     parser.add_argument("--train-amp-dtype", choices=("none", "bf16", "fp16"), default="bf16")
     parser.add_argument("--generate-position-ids-mode", choices=("none",), default="none")
@@ -523,6 +591,8 @@ def main() -> None:
         raise ValueError(
             f"samples_per_update={args.samples_per_update} must be divisible by world_size={world_size}."
         )
+    if args.rollout_backend == "vllm_single" and world_size != 1:
+        raise ValueError("rollout_backend=vllm_single is only for a single training process. Use nproc_per_node=1.")
 
     (
         _cl_sft_args,
@@ -573,6 +643,27 @@ def main() -> None:
         timeout=args.teacher_timeout,
         topk=args.topk,
     )
+    student_rollout = None
+    if args.rollout_backend == "vllm_single":
+        os.environ.setdefault("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
+        if model_args.model_name_or_path is None:
+            raise ValueError("rollout_backend=vllm_single requires model.model_name_or_path in the config.")
+        student_rollout = VLLMStudentRollout(
+            model_path=model_args.model_name_or_path,
+            tokenizer=tokenizer,
+            torch_dtype=args.student_vllm_dtype,
+            trust_remote_code=model_args.trust_remote_code,
+            tensor_parallel_size=1,
+            gpu_memory_utilization=args.student_vllm_gpu_memory_utilization,
+            max_model_len=args.student_vllm_max_model_len,
+            max_num_batched_tokens=args.student_vllm_max_num_batched_tokens,
+            max_num_seqs=args.student_vllm_max_num_seqs,
+            enforce_eager=args.student_vllm_enforce_eager,
+            device=f"cuda:{local_rank}",
+            disable_log_stats=True,
+            seed=0,
+            limit_mm_per_prompt={"image": 1, "video": 0},
+        )
 
     rank_print("=== online hf opd fsdp ===")
     rank_print(f"config={args.config}")
@@ -585,6 +676,10 @@ def main() -> None:
     rank_print(f"epochs={args.epochs}")
     rank_print(f"response_width={args.response_width}")
     rank_print(f"rollout_backend={args.rollout_backend}")
+    if args.rollout_backend == "vllm_single":
+        rank_print(f"student_vllm_dtype={args.student_vllm_dtype}")
+        rank_print(f"student_vllm_gpu_memory_utilization={args.student_vllm_gpu_memory_utilization}")
+        rank_print(f"student_vllm_max_model_len={args.student_vllm_max_model_len}")
     rank_print(f"teacher={args.teacher_host}:{args.teacher_port}")
     rank_print(f"generate_amp_dtype={args.generate_amp_dtype}")
     rank_print(f"train_amp_dtype={args.train_amp_dtype}")
@@ -678,9 +773,14 @@ def main() -> None:
                     row_end = group_start + local_offset_end
                     update_step += 1
 
+                    if student_rollout is not None:
+                        student_rollout.sync_from_hf_model(base_model)
+                        sync_cuda(device, f"student vLLM sync step {update_step}")
+
                     local_sequences_cpu, local_attention_cpu, local_response_mask_cpu = generate_local_sequences(
                         model=model,
                         base_model=base_model,
+                        student_rollout=student_rollout,
                         batch=batch,
                         non_tensor=non_tensor,
                         mm_inputs=mm_inputs,
@@ -691,6 +791,8 @@ def main() -> None:
                         response_width=args.response_width,
                         tokenizer=tokenizer,
                         device=device,
+                        image_token_id=image_token_id,
+                        video_token_id=video_token_id,
                         args=args,
                     )
                     seq_len = int(local_sequences_cpu.shape[1])
