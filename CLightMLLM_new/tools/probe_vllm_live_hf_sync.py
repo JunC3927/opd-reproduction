@@ -110,8 +110,34 @@ def find_load_weights_target(llm: Any, max_depth: int) -> tuple[Any | None, str 
 
 
 def _load_weights_on_worker(model: Any, weights: list[tuple[str, torch.Tensor]]) -> str:
-    result = model.load_weights(weights)
-    return repr(result)
+    named_buffers = dict(model.named_buffers())
+    param_updates = []
+    buffer_updates = []
+    for name, tensor in weights:
+        if name in named_buffers:
+            buffer_updates.append((name, tensor))
+        else:
+            param_updates.append((name, tensor))
+
+    result = model.load_weights(param_updates)
+    loaded_buffers = 0
+    for name, tensor in buffer_updates:
+        if name not in named_buffers:
+            continue
+        target = named_buffers[name]
+        if tuple(target.shape) != tuple(tensor.shape):
+            raise ValueError(f"Buffer shape mismatch for {name}: expected {tuple(target.shape)}, got {tuple(tensor.shape)}")
+        target.copy_(tensor.to(device=target.device, dtype=target.dtype), non_blocking=False)
+        loaded_buffers += 1
+
+    return repr(
+        {
+            "load_weights": result,
+            "param_updates": len(param_updates),
+            "buffer_updates": len(buffer_updates),
+            "loaded_buffers": loaded_buffers,
+        }
+    )
 
 
 def _apply_model_load_weights(owner: Any, owner_name: str, weights: list[tuple[str, torch.Tensor]]) -> tuple[bool, Any]:
@@ -161,6 +187,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--trust-remote-code", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--enforce-eager", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--local-files-only", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument(
+        "--apply-bucket-mb",
+        type=int,
+        default=1024,
+        help="Max approximate tensor payload per apply_model/load_weights call. Avoids >4GB serialization limits.",
+    )
     parser.add_argument(
         "--allow-insecure-serialization",
         action=argparse.BooleanOptionalAction,
@@ -274,6 +306,35 @@ def iter_live_weights(
         yield selected_name, state[selected_name].detach().cpu()
 
 
+def weight_nbytes(weight: tuple[str, torch.Tensor]) -> int:
+    return int(weight[1].numel() * weight[1].element_size())
+
+
+def bucket_weight_updates(
+    weights: list[tuple[str, torch.Tensor]],
+    *,
+    bucket_size_mb: int,
+) -> list[list[tuple[str, torch.Tensor]]]:
+    bucket_size = int(bucket_size_mb) << 20
+    if bucket_size <= 0:
+        return [weights]
+
+    buckets = []
+    current = []
+    current_bytes = 0
+    for item in weights:
+        item_bytes = weight_nbytes(item)
+        if current and current_bytes + item_bytes > bucket_size:
+            buckets.append(current)
+            current = []
+            current_bytes = 0
+        current.append(item)
+        current_bytes += item_bytes
+    if current:
+        buckets.append(current)
+    return buckets
+
+
 def split_buffer_updates(
     model: torch.nn.Module,
     weights: list[tuple[str, torch.Tensor]],
@@ -331,11 +392,22 @@ def load_vllm(args: argparse.Namespace) -> Any:
     return LLM(**kwargs)
 
 
-def try_load_weights(llm: Any, weights: list[tuple[str, torch.Tensor]], recursive_depth: int) -> bool:
-    target, target_path = find_load_weights_target(llm, recursive_depth)
+def try_load_weight_bucket(
+    *,
+    llm: Any,
+    target: Any | None,
+    owners: list[tuple[str, Any]],
+    weights: list[tuple[str, torch.Tensor]],
+    bucket_idx: int,
+    bucket_count: int,
+) -> bool:
+    bucket_bytes = sum(weight_nbytes(item) for item in weights)
+    print(
+        f"sync_bucket={bucket_idx + 1}/{bucket_count} tensors={len(weights)} bytes={bucket_bytes}",
+        flush=True,
+    )
+
     if target is not None:
-        print("load_weights_target_path =", target_path, flush=True)
-        print("load_weights_target_type =", type(target), flush=True)
         param_updates, buffer_updates, named_buffers = split_buffer_updates(target, weights)
         print("param_update_count =", len(param_updates), flush=True)
         print("buffer_update_count =", len(buffer_updates), flush=True)
@@ -343,25 +415,57 @@ def try_load_weights(llm: Any, weights: list[tuple[str, torch.Tensor]], recursiv
         loaded_buffers = apply_buffer_updates(buffer_updates, named_buffers)
         print("load_weights_return =", repr(result), flush=True)
         print("loaded_buffers =", loaded_buffers, flush=True)
-        print("weight_update_path = direct_load_weights", flush=True)
         return True
 
-    print("direct_load_weights_target = NOT_FOUND", flush=True)
-    print("llm interesting attrs =", interesting_attrs(llm), flush=True)
-    engine = safe_getattr(llm, "llm_engine")
-    if engine is not None:
-        print("llm.llm_engine type =", type(engine), flush=True)
-        print("llm.llm_engine interesting attrs =", interesting_attrs(engine), flush=True)
-
-    owners = [("llm", llm)]
-    if engine is not None:
-        owners.append(("llm.llm_engine", engine))
     for owner_name, owner in owners:
         ok, _ = _apply_model_load_weights(owner, owner_name, weights)
         if ok:
             print("weight_update_path =", f"{owner_name}.apply_model", flush=True)
             return True
     return False
+
+
+def try_load_weights(
+    llm: Any,
+    weights: list[tuple[str, torch.Tensor]],
+    recursive_depth: int,
+    *,
+    bucket_size_mb: int,
+) -> bool:
+    target, target_path = find_load_weights_target(llm, recursive_depth)
+    if target is not None:
+        print("load_weights_target_path =", target_path, flush=True)
+        print("load_weights_target_type =", type(target), flush=True)
+        owners: list[tuple[str, Any]] = []
+        weight_update_path = "direct_load_weights"
+    else:
+        print("direct_load_weights_target = NOT_FOUND", flush=True)
+        print("llm interesting attrs =", interesting_attrs(llm), flush=True)
+        engine = safe_getattr(llm, "llm_engine")
+        if engine is not None:
+            print("llm.llm_engine type =", type(engine), flush=True)
+            print("llm.llm_engine interesting attrs =", interesting_attrs(engine), flush=True)
+
+        owners = [("llm", llm)]
+        if engine is not None:
+            owners.append(("llm.llm_engine", engine))
+        weight_update_path = "apply_model"
+
+    buckets = bucket_weight_updates(weights, bucket_size_mb=bucket_size_mb)
+    print("sync_bucket_count =", len(buckets), flush=True)
+    for idx, bucket in enumerate(buckets):
+        ok = try_load_weight_bucket(
+            llm=llm,
+            target=target,
+            owners=owners,
+            weights=bucket,
+            bucket_idx=idx,
+            bucket_count=len(buckets),
+        )
+        if not ok:
+            return False
+    print("weight_update_path =", weight_update_path, flush=True)
+    return True
 
 
 def main() -> None:
@@ -393,7 +497,7 @@ def main() -> None:
     print("sync_weight_count =", len(weights), flush=True)
     print("sync_weight_source = live_hf_model_state_dict", flush=True)
 
-    if try_load_weights(llm, weights, args.recursive_depth):
+    if try_load_weights(llm, weights, args.recursive_depth, bucket_size_mb=args.apply_bucket_mb):
         print("RESULT=OK", flush=True)
     else:
         print("RESULT=NO_WEIGHT_UPDATE_PATH", flush=True)
