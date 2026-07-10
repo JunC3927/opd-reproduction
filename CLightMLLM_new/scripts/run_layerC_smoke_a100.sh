@@ -7,9 +7,9 @@ TEACHER_MODEL="${TEACHER_MODEL:-/work/03/gw42/j40004/models/Qwen3-VL-8B-Instruct
 SRC_DIR="${SRC_DIR:-/work/03/gw42/j40004/cj/opd_dumps/qwen3_vl_2b_from_8b_geo3k_layerA_3epoch_swanlab_dumpALL_3gpu_mbs12_chunk12}"
 OUT_DIR="${OUT_DIR:-/work/03/gw42/j40004/cj/opd_dumps/layerC_smoke_student_rollout_teacher_rescore}"
 
-TEACHER_GPU="${TEACHER_GPU:-1}"
-STUDENT_GPU="${STUDENT_GPU:-0}"
-FSDP_GPUS="${FSDP_GPUS:-0,1,2}"
+TEACHER_GPU="${TEACHER_GPU:-7}"
+STUDENT_GPU="${STUDENT_GPU:-6}"
+FSDP_GPUS="${FSDP_GPUS:-3,4,5}"
 FSDP_NPROC="${FSDP_NPROC:-3}"
 TEACHER_PORT="${TEACHER_PORT:-29577}"
 MAX_FILES="${MAX_FILES:-2}"
@@ -41,8 +41,22 @@ echo "out=$OUT_DIR"
 echo "teacher_gpu=$TEACHER_GPU student_gpu=$STUDENT_GPU fsdp_gpus=$FSDP_GPUS"
 echo "max_files=$MAX_FILES"
 
+wait_gpu_below_mib() {
+  local gpu="$1"
+  local limit_mib="${2:-2048}"
+  local used_mib=""
+  for _ in $(seq 1 60); do
+    used_mib="$(nvidia-smi -i "$gpu" --query-gpu=memory.used --format=csv,noheader,nounits 2>/dev/null | head -n 1 | tr -d ' ')"
+    if [[ -n "$used_mib" ]] && [[ "$used_mib" =~ ^[0-9]+$ ]] && (( used_mib < limit_mib )); then
+      return 0
+    fi
+    sleep 2
+  done
+  echo "WARNING: gpu $gpu still uses ${used_mib:-unknown} MiB after waiting; continuing" >&2
+}
+
 echo "== start teacher server =="
-CUDA_VISIBLE_DEVICES="$TEACHER_GPU" python tools/serve_vllm_teacher.py \
+setsid env CUDA_VISIBLE_DEVICES="$TEACHER_GPU" python tools/serve_vllm_teacher.py \
   --model "$TEACHER_MODEL" \
   --host 127.0.0.1 \
   --port "$TEACHER_PORT" \
@@ -63,7 +77,14 @@ TEACHER_PID=$!
 
 cleanup_teacher() {
   if kill -0 "$TEACHER_PID" 2>/dev/null; then
-    kill "$TEACHER_PID" 2>/dev/null || true
+    kill -TERM "-$TEACHER_PID" 2>/dev/null || kill "$TEACHER_PID" 2>/dev/null || true
+    for _ in $(seq 1 20); do
+      if ! kill -0 "$TEACHER_PID" 2>/dev/null; then
+        break
+      fi
+      sleep 1
+    done
+    kill -KILL "-$TEACHER_PID" 2>/dev/null || true
     wait "$TEACHER_PID" 2>/dev/null || true
   fi
 }
@@ -112,6 +133,11 @@ CUDA_VISIBLE_DEVICES="$STUDENT_GPU" python tools/build_layerC_smoke_trace.py \
 
 cleanup_teacher
 trap - EXIT
+wait_gpu_below_mib "$TEACHER_GPU" 2048
+wait_gpu_below_mib "$STUDENT_GPU" 2048
+
+echo "== gpu before FSDP replay =="
+nvidia-smi --query-gpu=index,memory.used,memory.free,utilization.gpu --format=csv
 
 echo "== replay/train Layer C smoke traces =="
 CUDA_VISIBLE_DEVICES="$FSDP_GPUS" torchrun --standalone --nproc_per_node="$FSDP_NPROC" \
