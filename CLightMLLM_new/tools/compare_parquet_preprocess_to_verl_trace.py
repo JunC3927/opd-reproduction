@@ -21,7 +21,7 @@ for path in (ROOT, TOOLS):
         sys.path.insert(0, str(path))
 
 from check_opd_preprocess import _DummyTrainer, _load_processor_and_tokenizer  # noqa: E402
-from src.data.module import DatasetBuilder, TemplateFactory, VLCollator  # noqa: E402
+from src.data.module import DatasetBuilder, SupervisedPreprocessor, TemplateFactory, VLCollator  # noqa: E402
 from src.hparams import parse_torch_dtype  # noqa: E402
 from train import TrainingApp  # noqa: E402
 
@@ -134,6 +134,92 @@ def sample_images(sample: dict[str, Any]) -> list[Any]:
     return to_list(sample.get("images"))
 
 
+def _as_python(value: Any) -> Any:
+    if hasattr(value, "tolist") and not isinstance(value, ImageObject):
+        try:
+            return value.tolist()
+        except Exception:
+            return value
+    return value
+
+
+def normalize_verl_prompt(value: Any) -> list[dict[str, str]]:
+    value = _as_python(value)
+    if value is None:
+        raise ValueError("VERL parquet row is missing the prompt column.")
+
+    turns: list[dict[str, str]] = []
+    for turn in list(value):
+        turn = _as_python(turn)
+        if not isinstance(turn, dict):
+            raise TypeError(f"Expected prompt turn to be a dict, got {type(turn).__name__}: {turn!r}")
+        role = turn.get("role", turn.get("from"))
+        content = turn.get("content", turn.get("value"))
+        if role is None or content is None:
+            raise KeyError(f"Prompt turn must contain role/content or from/value keys: {turn!r}")
+        turns.append({"role": str(role), "content": str(content)})
+    return turns
+
+
+def detect_dataset_format(dataset_path: str | None) -> str | None:
+    if not dataset_path:
+        return None
+    try:
+        import pyarrow.parquet as pq
+
+        path = Path(dataset_path)
+        parquet_files = sorted(path.glob("*.parquet")) if path.is_dir() else [path]
+        columns = set(pq.read_schema(parquet_files[0]).names)
+    except Exception:
+        return None
+    if "prompt" in columns and "conversations" not in columns:
+        return "verl"
+    return None
+
+
+def build_verl_parquet_dataset(
+    *,
+    args: argparse.Namespace,
+    data_args: Any,
+    template: Any,
+    tokenizer: Any,
+    processor: Any,
+) -> list[dict[str, Any]]:
+    if not args.dataset_path:
+        raise ValueError("--dataset-path is required when --parquet-format=verl.")
+
+    from datasets import load_dataset
+
+    raw_dataset = load_dataset("parquet", data_files=args.dataset_path, split="train")
+    if args.max_samples > 0:
+        raw_dataset = raw_dataset.select(range(min(args.max_samples, len(raw_dataset))))
+
+    preprocessor = SupervisedPreprocessor(
+        template=template,
+        tokenizer=tokenizer,
+        processor=processor,
+        data_args=data_args,
+    )
+    samples: list[dict[str, Any]] = []
+    for row in raw_dataset:
+        prompt = normalize_verl_prompt(row.get("prompt"))
+        images = to_list(row.get("images", row.get("image")))
+        prompt_ids = preprocessor.encode_prompt_example(prompt=prompt, system=row.get("system"), images=images)
+        attention_mask = [1] * len(prompt_ids)
+        samples.append(
+            {
+                "input_ids": prompt_ids,
+                "attention_mask": attention_mask,
+                "labels": [-100] * len(prompt_ids),
+                "images": images,
+                "prompt_input_ids": prompt_ids,
+                "prompt_attention_mask": attention_mask,
+                "reference_text": str(row.get("answer", "")),
+            }
+        )
+    return samples
+
+
 def build_dataset(args: argparse.Namespace) -> tuple[Any, Any, Any, Any, Any]:
     os.chdir(ROOT)
     (
@@ -180,6 +266,19 @@ def build_dataset(args: argparse.Namespace) -> tuple[Any, Any, Any, Any, Any]:
 
     processor, tokenizer = _load_processor_and_tokenizer(model_args)
     template = TemplateFactory.from_args(tokenizer, data_args)
+    parquet_format = args.parquet_format
+    if parquet_format == "auto":
+        parquet_format = detect_dataset_format(args.dataset_path) or "sharegpt"
+    if parquet_format == "verl":
+        dataset = build_verl_parquet_dataset(
+            args=args,
+            data_args=data_args,
+            template=template,
+            tokenizer=tokenizer,
+            processor=processor,
+        )
+        return dataset, template, tokenizer, processor, model_args
+
     dataset = DatasetBuilder(
         template=template,
         model_args=model_args,
@@ -224,6 +323,12 @@ def main() -> None:
     parser.add_argument("--use-cache", action="store_true")
     parser.add_argument("--model-path", default=None, help="Override model.model_name_or_path in the config.")
     parser.add_argument("--dataset-path", default=None, help="Override file_name_or_path for the selected dataset.")
+    parser.add_argument(
+        "--parquet-format",
+        choices=["auto", "sharegpt", "verl"],
+        default="auto",
+        help="Use 'verl' for VERL-format parquet with prompt/images columns.",
+    )
     parser.add_argument("--output", default=None, help="Optional JSONL output path.")
     parser.add_argument("--print-first", type=int, default=12)
     args = parser.parse_args()
