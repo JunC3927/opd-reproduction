@@ -1,3 +1,3 @@
-from .module import IMAGE_PLACEHOLDER, TemplateFactory, VLCollator, VLSFTDataModule
+from .module import TemplateFactory, VLSFTDataModule
 
-__all__ = ["IMAGE_PLACEHOLDER", "TemplateFactory", "VLCollator", "VLSFTDataModule"]
+__all__ = ["TemplateFactory", "VLSFTDataModule"]

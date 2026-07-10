@@ -14,6 +14,7 @@ from typing import Any
 
 import torch
 import torch.distributed as dist
+from omegaconf import OmegaConf
 from torch.distributed.fsdp import (
     BackwardPrefetch,
     FullyShardedDataParallel as FSDP,
@@ -24,18 +25,15 @@ from torch.distributed.fsdp import (
 from torch.distributed.fsdp.wrap import size_based_auto_wrap_policy
 
 try:
-    from datasets import load_dataset
-except Exception:  # pragma: no cover - parquet source is optional.
-    load_dataset = None
-
-try:
     from tqdm.auto import tqdm
 except Exception:  # pragma: no cover - tqdm may not be installed in lean envs.
     tqdm = None
 
 ROOT = Path(__file__).resolve().parents[1]
 TOOLS = Path(__file__).resolve().parent
-for path in (ROOT, TOOLS):
+REPO_ROOT = ROOT.parent
+VERL_ROOT = REPO_ROOT / "verl_new"
+for path in (ROOT, TOOLS, VERL_ROOT):
     if str(path) not in sys.path:
         sys.path.insert(0, str(path))
 
@@ -68,10 +66,12 @@ from replay_verl_opd_trace_fsdp import (  # noqa: E402
     select_fsdp_update_probes,
     split_contiguous_rows,
 )
-from src.data import IMAGE_PLACEHOLDER, TemplateFactory, VLCollator  # noqa: E402
 from src.method.vllm_teacher_client import RemoteTeacherScorer  # noqa: E402
 from src.method.vllm_student import VLLMStudentRollout  # noqa: E402
 from src.model import ModelTuner, load_processor_and_tokenizer, load_vision_language_model  # noqa: E402
+from verl.utils.chat_template import apply_chat_template  # noqa: E402
+from verl.utils.dataset.rl_dataset import RLHFDataset  # noqa: E402
+from verl.utils.tokenizer import build_multimodal_processor_inputs, normalize_token_ids  # noqa: E402
 
 
 def is_rank0() -> bool:
@@ -130,151 +130,216 @@ def expand_parquet_paths(paths: list[str]) -> list[str]:
     return expanded
 
 
-def normalize_geo3k_prompt(raw_prompt: Any, images: list[Any]) -> list[dict[str, str]]:
-    if isinstance(raw_prompt, str):
-        prompt = [{"role": "user", "content": raw_prompt}]
-    elif isinstance(raw_prompt, list):
-        prompt = []
-        for turn in raw_prompt:
-            if not isinstance(turn, dict):
-                continue
-            role = str(turn.get("role", "user"))
-            content = str(turn.get("content", ""))
-            prompt.append({"role": role, "content": content})
-    else:
-        prompt = [{"role": "user", "content": str(raw_prompt)}]
-
-    if not prompt:
-        prompt = [{"role": "user", "content": ""}]
-
-    image_count = len(images)
-    placeholder_count = sum(turn["content"].count(IMAGE_PLACEHOLDER) for turn in prompt)
-    if image_count > placeholder_count:
-        missing = image_count - placeholder_count
-        prompt[0]["content"] = f"{IMAGE_PLACEHOLDER * missing}\n{prompt[0]['content']}"
-    return prompt
+def parse_json_object(value: str | None, *, arg_name: str) -> dict[str, Any]:
+    if value is None or value == "":
+        return {}
+    try:
+        parsed = json.loads(value)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"{arg_name} must be a JSON object string, got: {value!r}") from exc
+    if not isinstance(parsed, dict):
+        raise ValueError(f"{arg_name} must decode to a JSON object, got {type(parsed).__name__}.")
+    return parsed
 
 
-def normalize_geo3k_images(value: Any) -> list[Any]:
+def make_verl_parquet_config(args: argparse.Namespace) -> Any:
+    max_prompt_length = args.parquet_max_prompt_length
+    if max_prompt_length <= 0:
+        max_prompt_length = max(1, int(args.student_vllm_max_model_len) - int(args.response_width))
+    return OmegaConf.create(
+        {
+            "cache_dir": args.parquet_cache_dir or "~/.cache/verl/rlhf",
+            "prompt_key": args.parquet_prompt_key,
+            "image_key": args.parquet_image_key,
+            "video_key": args.parquet_video_key,
+            "audio_key": args.parquet_audio_key,
+            "max_prompt_length": max_prompt_length,
+            "truncation": args.parquet_truncation,
+            "filter_overlong_prompts": bool(args.parquet_filter_overlong_prompts),
+            "filter_overlong_prompts_workers": int(args.parquet_filter_workers),
+            "return_multi_modal_inputs": True,
+            "shuffle": False,
+            "apply_chat_template_kwargs": parse_json_object(
+                args.parquet_apply_chat_template_kwargs,
+                arg_name="--parquet-apply-chat-template-kwargs",
+            ),
+            "mm_processor_kwargs": parse_json_object(
+                args.parquet_mm_processor_kwargs,
+                arg_name="--parquet-mm-processor-kwargs",
+            ),
+        }
+    )
+
+
+def tensor_dict_to_cpu(value: Any) -> dict[str, Any]:
+    if hasattr(value, "convert_to_tensors"):
+        value = value.convert_to_tensors("pt")
+    out: dict[str, Any] = {}
+    for key, item in dict(value).items():
+        if torch.is_tensor(item):
+            out[key] = item.detach().cpu()
+        else:
+            out[key] = item
+    return out
+
+
+def normalize_mm_media(value: Any) -> list[Any]:
     if value is None:
         return []
-    if isinstance(value, list):
-        return [image for image in value if image is not None]
     if isinstance(value, tuple):
-        return [image for image in value if image is not None]
+        value = list(value)
+    if isinstance(value, list):
+        return [item for item in value if item is not None]
     return [value]
 
 
-def encode_prompt_ids(
+def build_verl_geo3k_feature(
     *,
-    prompt: list[dict[str, str]],
-    images: list[Any],
-    collator: VLCollator,
-) -> list[int]:
-    messages = collator.template.mm_plugin.process_messages(prompt, images, collator.processor)
-    encoded = collator.template.encode_messages(collator.tokenizer, messages, system=None)
-    return [token_id for turn_ids in encoded for token_id in turn_ids]
-
-
-def build_geo3k_feature(
     row: dict[str, Any],
-    row_index: int,
-    collator: VLCollator,
-) -> tuple[dict[str, Any], dict[str, Any]]:
-    images = normalize_geo3k_images(row.get("images") or row.get("image"))
-    prompt = normalize_geo3k_prompt(row.get("prompt", row.get("problem", "")), images)
-    prompt_ids = encode_prompt_ids(prompt=prompt, images=images, collator=collator)
-    reward_model = row.get("reward_model")
+    processor: Any,
+    tokenizer: Any,
+    dataset_config: Any,
+) -> dict[str, Any]:
+    messages = row["raw_prompt"]
+    image_patch_size = dataset_config.get(
+        "image_patch_size",
+        getattr(getattr(processor, "image_processor", None), "patch_size", 14),
+    )
+    images, videos, audios = RLHFDataset._process_multi_modal_info(
+        messages,
+        image_patch_size=image_patch_size,
+        config=dataset_config,
+    )
+    images_list = normalize_mm_media(images)
+    videos_list = normalize_mm_media(videos)
+    audios_list = normalize_mm_media(audios)
+    apply_kwargs = dict(dataset_config.get("apply_chat_template_kwargs", {}) or {})
+    mm_processor_kwargs = dict(dataset_config.get("mm_processor_kwargs", {}) or {})
+
+    if processor is not None:
+        raw_prompt_text = apply_chat_template(
+            processor,
+            messages,
+            add_generation_prompt=True,
+            tokenize=False,
+            **apply_kwargs,
+        )
+        model_inputs = build_multimodal_processor_inputs(
+            processor,
+            text=[raw_prompt_text],
+            images=images if images_list else None,
+            videos=videos if videos_list else None,
+            audio=audios if audios_list else None,
+            mm_processor_kwargs=mm_processor_kwargs,
+        )
+        prompt_ids = normalize_token_ids(model_inputs.pop("input_ids"))
+        attention_mask_value = model_inputs.pop("attention_mask", None)
+        attention_mask = (
+            normalize_token_ids(attention_mask_value)
+            if attention_mask_value is not None
+            else [1] * len(prompt_ids)
+        )
+        multi_modal_inputs = tensor_dict_to_cpu(model_inputs)
+    else:
+        tokenized_prompt = apply_chat_template(
+            tokenizer,
+            messages,
+            add_generation_prompt=True,
+            tokenize=True,
+            **apply_kwargs,
+        )
+        prompt_ids = normalize_token_ids(tokenized_prompt)
+        attention_mask = [1] * len(prompt_ids)
+        multi_modal_inputs = {}
+
+    max_prompt_length = int(dataset_config.get("max_prompt_length", 1024))
+    if len(prompt_ids) > max_prompt_length:
+        raise ValueError(
+            f"VERL parquet prompt has {len(prompt_ids)} tokens, exceeding max_prompt_length={max_prompt_length}. "
+            "Increase --parquet-max-prompt-length or reduce image/text size."
+        )
+    if len(attention_mask) != len(prompt_ids):
+        attention_mask = [1] * len(prompt_ids)
+
+    image_grid_thw = multi_modal_inputs.get("image_grid_thw")
+    if torch.is_tensor(image_grid_thw) and "images_seqlens" not in multi_modal_inputs:
+        grid = image_grid_thw.long()
+        multi_modal_inputs["images_seqlens"] = torch.repeat_interleave(
+            grid[:, 1] * grid[:, 2],
+            grid[:, 0],
+        ).detach().cpu()
+    if not multi_modal_inputs:
+        multi_modal_inputs = None
+
     extra_info = row.get("extra_info")
     if not isinstance(extra_info, dict):
-        extra_info = {"index": row_index}
-    extra_info = dict(extra_info)
-    extra_info.setdefault("index", row_index)
-    feature = {
-        "input_ids": prompt_ids,
-        "attention_mask": [1] * len(prompt_ids),
-        "labels": [-100] * len(prompt_ids),
-        "images": images,
+        extra_info = {"index": int(row.get("index", 0))}
+    else:
+        extra_info = dict(extra_info)
+        extra_info.setdefault("index", int(row.get("index", 0)))
+
+    multi_modal_data: dict[str, Any] = {}
+    if images_list:
+        multi_modal_data["images"] = images_list
+        multi_modal_data["image"] = images_list
+    if videos_list:
+        multi_modal_data["videos"] = videos_list
+        multi_modal_data["video"] = videos_list
+    if audios_list:
+        multi_modal_data["audios"] = audios_list
+
+    return {
         "prompt_input_ids": prompt_ids,
-        "prompt_attention_mask": [1] * len(prompt_ids),
-        "reference_text": str(extra_info.get("answer", "")),
-    }
-    metadata = {
+        "prompt_attention_mask": attention_mask,
+        "multi_modal_inputs": multi_modal_inputs,
+        "multi_modal_data": multi_modal_data,
+        "vllm_images": images_list,
+        "mm_processor_kwargs": mm_processor_kwargs,
         "data_source": row.get("data_source", "geo3k"),
-        "reward_model": reward_model if isinstance(reward_model, dict) else {},
+        "reward_model": row.get("reward_model") if isinstance(row.get("reward_model"), dict) else {},
         "extra_info": extra_info,
-        "raw_prompt": prompt,
+        "raw_prompt": messages,
         "ability": row.get("ability", "geometry"),
     }
-    return feature, metadata
 
 
-def split_collated_mm_inputs(collated: dict[str, Any], images_per_sample: list[list[Any]]) -> list[dict[str, Any] | None]:
-    image_grid_thw = collated.get("image_grid_thw")
-    pixel_values = collated.get("pixel_values")
-    if image_grid_thw is None:
-        return [None for _ in images_per_sample]
-    if not torch.is_tensor(image_grid_thw):
-        image_grid_thw = torch.as_tensor(image_grid_thw)
-    if pixel_values is not None and not torch.is_tensor(pixel_values):
-        pixel_values = torch.as_tensor(pixel_values)
-
-    per_sample: list[dict[str, Any] | None] = []
-    grid_offset = 0
-    pixel_offset = 0
-    for images in images_per_sample:
-        image_count = len(images)
-        if image_count <= 0:
-            per_sample.append(None)
-            continue
-
-        sample_grids = image_grid_thw[grid_offset : grid_offset + image_count].detach().cpu()
-        grid_offset += image_count
-        item: dict[str, Any] = {"image_grid_thw": sample_grids}
-        if pixel_values is not None:
-            patch_count = int(sample_grids.long().prod(dim=1).sum().item())
-            item["pixel_values"] = pixel_values[pixel_offset : pixel_offset + patch_count].detach().cpu()
-            pixel_offset += patch_count
-        if "images_seqlens" in collated and collated["images_seqlens"] is not None:
-            images_seqlens = collated["images_seqlens"]
-            if torch.is_tensor(images_seqlens):
-                item["images_seqlens"] = images_seqlens[grid_offset - image_count : grid_offset].detach().cpu()
-        per_sample.append(item)
-    return per_sample
+def pad_prompt_features(
+    features: list[dict[str, Any]],
+    *,
+    pad_token_id: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    max_len = max(len(item["prompt_input_ids"]) for item in features)
+    prompts = torch.full((len(features), max_len), int(pad_token_id), dtype=torch.long)
+    attention = torch.zeros((len(features), max_len), dtype=torch.long)
+    for row_idx, item in enumerate(features):
+        ids = torch.as_tensor(item["prompt_input_ids"], dtype=torch.long)
+        mask = torch.as_tensor(item["prompt_attention_mask"], dtype=torch.long)
+        width = int(ids.numel())
+        prompts[row_idx, -width:] = ids
+        attention[row_idx, -width:] = mask
+    return prompts, attention
 
 
 def features_to_trace_payload(
     *,
     features: list[dict[str, Any]],
-    metadata: list[dict[str, Any]],
-    collator: VLCollator,
+    pad_token_id: int,
 ) -> dict[str, Any]:
-    collated = collator(features)
-    prompts = collated["prompt_input_ids"].long()
-    prompt_attention = collated["prompt_attention_mask"].long()
+    prompts, prompt_attention = pad_prompt_features(features, pad_token_id=pad_token_id)
     batch = {
         "prompts": prompts,
         "attention_mask": prompt_attention,
     }
-    if "position_ids" in collated:
-        position_ids = collated["position_ids"]
-        if torch.is_tensor(position_ids):
-            batch["position_ids"] = position_ids[..., : prompts.shape[1]].detach().cpu()
-
-    vllm_images = collated.get("vllm_images") or [[] for _ in features]
-    multi_modal_inputs = split_collated_mm_inputs(collated, vllm_images)
-    multi_modal_data = [{"images": images, "image": images} for images in vllm_images]
-
     non_tensor = {
-        "data_source": [item["data_source"] for item in metadata],
-        "reward_model": [item["reward_model"] for item in metadata],
-        "extra_info": [item["extra_info"] for item in metadata],
-        "raw_prompt": [item["raw_prompt"] for item in metadata],
-        "ability": [item["ability"] for item in metadata],
-        "multi_modal_inputs": multi_modal_inputs,
-        "multi_modal_data": multi_modal_data,
-        "vllm_images": vllm_images,
-        "mm_processor_kwargs": [None for _ in features],
+        "data_source": [item["data_source"] for item in features],
+        "reward_model": [item["reward_model"] for item in features],
+        "extra_info": [item["extra_info"] for item in features],
+        "raw_prompt": [item["raw_prompt"] for item in features],
+        "ability": [item["ability"] for item in features],
+        "multi_modal_inputs": [item["multi_modal_inputs"] for item in features],
+        "multi_modal_data": [item["multi_modal_data"] for item in features],
+        "vllm_images": [item["vllm_images"] for item in features],
+        "mm_processor_kwargs": [item["mm_processor_kwargs"] for item in features],
     }
     return {"batch": batch, "non_tensor_batch": non_tensor}
 
@@ -283,24 +348,33 @@ def iter_geo3k_parquet_payloads(
     *,
     paths: list[str],
     samples_per_update: int,
-    collator: VLCollator,
+    processor: Any,
+    tokenizer: Any,
+    dataset_config: Any,
+    pad_token_id: int,
     max_rows: int = 0,
 ) -> Any:
-    if load_dataset is None:
-        raise ImportError("Geo3K parquet data source requires the `datasets` package.")
-    dataset = load_dataset("parquet", data_files=paths, split="train")
-    total = len(dataset) if max_rows <= 0 else min(len(dataset), max_rows)
+    dataset = RLHFDataset(
+        data_files=paths,
+        tokenizer=tokenizer,
+        processor=processor,
+        config=dataset_config,
+        max_samples=max_rows if max_rows > 0 else -1,
+    )
+    total = len(dataset)
     features: list[dict[str, Any]] = []
-    metadata: list[dict[str, Any]] = []
     for row_index in range(total):
         row = dataset[int(row_index)]
-        feature, item_metadata = build_geo3k_feature(row, row_index, collator)
+        feature = build_verl_geo3k_feature(
+            row=row,
+            processor=processor,
+            tokenizer=tokenizer,
+            dataset_config=dataset_config,
+        )
         features.append(feature)
-        metadata.append(item_metadata)
         if len(features) == samples_per_update:
-            yield features_to_trace_payload(features=features, metadata=metadata, collator=collator)
+            yield features_to_trace_payload(features=features, pad_token_id=pad_token_id)
             features = []
-            metadata = []
 
 
 def row_value(values: Any, row: int) -> Any:
@@ -934,6 +1008,34 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dump-traces", action="store_true")
     parser.add_argument("--dump-trace-dir", default=None)
     parser.add_argument("--parquet-max-rows", type=int, default=0, help="Limit Geo3K parquet rows for smoke tests.")
+    parser.add_argument("--parquet-prompt-key", default="prompt")
+    parser.add_argument("--parquet-image-key", default="images")
+    parser.add_argument("--parquet-video-key", default="videos")
+    parser.add_argument("--parquet-audio-key", default="audios")
+    parser.add_argument(
+        "--parquet-max-prompt-length",
+        type=int,
+        default=0,
+        help="VERL RLHFDataset max_prompt_length. Defaults to student_vllm_max_model_len - response_width.",
+    )
+    parser.add_argument("--parquet-truncation", default="error")
+    parser.add_argument(
+        "--parquet-filter-overlong-prompts",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
+    parser.add_argument("--parquet-filter-workers", type=int, default=1)
+    parser.add_argument("--parquet-cache-dir", default=None)
+    parser.add_argument(
+        "--parquet-mm-processor-kwargs",
+        default=None,
+        help='JSON object passed to VERL build_multimodal_processor_inputs, e.g. \'{"max_pixels":1048576}\'.',
+    )
+    parser.add_argument(
+        "--parquet-apply-chat-template-kwargs",
+        default=None,
+        help="JSON object passed to VERL apply_chat_template.",
+    )
     return parser.parse_args()
 
 
@@ -1040,6 +1142,9 @@ def main() -> None:
     )
     image_token_id = getattr(getattr(base_model, "config", None), "image_token_id", None)
     video_token_id = getattr(getattr(base_model, "config", None), "video_token_id", None)
+    if tokenizer.pad_token_id is None:
+        tokenizer.pad_token_id = tokenizer.eos_token_id
+    pad_token_id = int(tokenizer.pad_token_id)
 
     auto_wrap_policy = partial(size_based_auto_wrap_policy, min_num_params=args.fsdp_min_num_params)
     model = FSDP(
@@ -1058,17 +1163,9 @@ def main() -> None:
         timeout=args.teacher_timeout,
         topk=args.topk,
     )
-    parquet_collator = None
+    parquet_dataset_config = None
     if args.data_source == "geo3k_parquet":
-        template = TemplateFactory.from_args(tokenizer, data_args)
-        parquet_collator = VLCollator(
-            tokenizer=tokenizer,
-            model=base_model,
-            template=template,
-            processor=processor,
-            torch_dtype=torch.bfloat16,
-            padding=True,
-        )
+        parquet_dataset_config = make_verl_parquet_config(args)
     if args.rollout_backend in {"vllm_single", "vllm_ipc"} and is_rank0():
         if student_rollout is None:
             student_rollout = build_student_vllm_rollout(
@@ -1096,6 +1193,11 @@ def main() -> None:
     rank_print(f"epochs={args.epochs}")
     rank_print(f"response_width={args.response_width}")
     rank_print(f"rollout_backend={args.rollout_backend}")
+    if args.data_source == "geo3k_parquet" and parquet_dataset_config is not None:
+        rank_print(f"parquet_prompt_key={parquet_dataset_config.prompt_key}")
+        rank_print(f"parquet_image_key={parquet_dataset_config.image_key}")
+        rank_print(f"parquet_max_prompt_length={parquet_dataset_config.max_prompt_length}")
+        rank_print(f"parquet_filter_overlong_prompts={parquet_dataset_config.filter_overlong_prompts}")
     if args.rollout_backend in {"vllm_single", "vllm_ipc"}:
         rank_print(f"student_vllm_dtype={args.student_vllm_dtype}")
         rank_print(f"student_vllm_device={args.student_vllm_device or f'cuda:{local_rank}'}")
@@ -1167,15 +1269,18 @@ def main() -> None:
             if args.data_source == "trace":
                 source_iter = ((path, load_trace(path)) for path in paths)
             else:
-                if parquet_collator is None:
-                    raise RuntimeError("parquet_collator is required for data_source=geo3k_parquet.")
+                if parquet_dataset_config is None:
+                    raise RuntimeError("parquet_dataset_config is required for data_source=geo3k_parquet.")
                 source_iter = (
                     (f"geo3k_parquet_chunk{chunk_idx:06d}", payload)
                     for chunk_idx, payload in enumerate(
                         iter_geo3k_parquet_payloads(
                             paths=paths,
                             samples_per_update=args.samples_per_update,
-                            collator=parquet_collator,
+                            processor=processor,
+                            tokenizer=tokenizer,
+                            dataset_config=parquet_dataset_config,
+                            pad_token_id=pad_token_id,
                             max_rows=args.parquet_max_rows,
                         )
                     )
