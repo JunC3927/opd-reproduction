@@ -3,7 +3,7 @@ import json
 import os
 import re
 import sys
-from contextlib import ExitStack, contextmanager, nullcontext
+from contextlib import nullcontext
 from dataclasses import replace
 from functools import partial
 from pathlib import Path
@@ -180,67 +180,6 @@ def completion_mask(responses: torch.Tensor, *, pad_token_id: int, eos_token_id:
     return mask.long()
 
 
-@contextmanager
-def summon_fsdp_full_params_for_generate(model: FSDP):
-    fsdp_modules = []
-    seen: set[int] = set()
-    for module in model.modules():
-        if isinstance(module, FSDP) and id(module) not in seen:
-            fsdp_modules.append(module)
-            seen.add(id(module))
-
-    with ExitStack() as stack:
-        for module in fsdp_modules:
-            stack.enter_context(FSDP.summon_full_params(module, writeback=False, recurse=False))
-        yield
-
-
-def hf_generate_kwargs(args: argparse.Namespace, tokenizer: Any) -> dict[str, Any]:
-    kwargs = {
-        "max_new_tokens": int(args.response_width),
-        "do_sample": bool(args.rollout_do_sample),
-        "temperature": float(args.rollout_temperature),
-        "top_p": float(args.rollout_top_p),
-        "top_k": int(args.rollout_top_k),
-        "pad_token_id": int(tokenizer.pad_token_id),
-        "eos_token_id": getattr(tokenizer, "eos_token_id", None),
-        "use_cache": True,
-    }
-    if kwargs["top_k"] <= 0:
-        kwargs["top_k"] = 0
-    if dist.is_initialized():
-        kwargs["synced_gpus"] = True
-    return kwargs
-
-
-@contextmanager
-def temporary_generation_config_overrides(model: torch.nn.Module, generate_kwargs: dict[str, Any]):
-    generation_config = getattr(model, "generation_config", None)
-    if generation_config is None:
-        yield
-        return
-
-    keys = (
-        "max_new_tokens",
-        "do_sample",
-        "temperature",
-        "top_p",
-        "top_k",
-        "pad_token_id",
-        "eos_token_id",
-        "use_cache",
-    )
-    old_values = {key: getattr(generation_config, key, None) for key in keys}
-    for key in keys:
-        if key in generate_kwargs:
-            setattr(generation_config, key, generate_kwargs[key])
-    try:
-        yield
-    finally:
-        for key, value in old_values.items():
-            setattr(generation_config, key, value)
-
-
 def pad_or_truncate_responses(
     responses: torch.Tensor,
     *,
@@ -295,59 +234,62 @@ def generate_local_sequences(
     finished = torch.zeros(row_end - row_start, dtype=torch.bool, device=device)
     eos_token_id = getattr(tokenizer, "eos_token_id", None)
     pad_token_id = int(tokenizer.pad_token_id)
+    use_kv_cache = args.rollout_backend in {"manual_cache", "hf_generate"}
+    past_key_values = None
 
     with torch.no_grad():
-        if args.rollout_backend == "hf_generate":
-            forward_kwargs: dict[str, Any] = {
-                "input_ids": sequences,
-                "attention_mask": attention_mask,
-            }
-            forward_kwargs.update(build_mm_kwargs(mm_inputs, row_start, row_end, device))
-            with summon_fsdp_full_params_for_generate(model):
-                with autocast_context(args.generate_amp_dtype):
-                    generate_kwargs = hf_generate_kwargs(args, tokenizer)
-                    with temporary_generation_config_overrides(model.module, generate_kwargs):
-                        generated = model.module.generate(**forward_kwargs, **generate_kwargs)
-            responses = pad_or_truncate_responses(
-                generated[:, prompt_width:],
-                response_width=response_width,
-                pad_token_id=pad_token_id,
-            )
-        else:
-            for step in range(response_width):
+        for step in range(response_width):
+            if use_kv_cache and past_key_values is not None:
+                input_ids = sequences[:, -1:]
                 forward_kwargs = {
-                    "input_ids": sequences,
+                    "input_ids": input_ids,
                     "attention_mask": attention_mask,
-                    "use_cache": False,
+                    "past_key_values": past_key_values,
+                    "use_cache": True,
+                    "cache_position": torch.arange(
+                        attention_mask.shape[1] - input_ids.shape[1],
+                        attention_mask.shape[1],
+                        dtype=torch.long,
+                        device=device,
+                    ),
+                }
+            else:
+                input_ids = sequences
+                forward_kwargs = {
+                    "input_ids": input_ids,
+                    "attention_mask": attention_mask,
+                    "use_cache": bool(use_kv_cache),
                 }
                 forward_kwargs.update(build_mm_kwargs(mm_inputs, row_start, row_end, device))
-                mm_token_type_ids = build_mm_token_type_ids(base_model, sequences)
+                mm_token_type_ids = build_mm_token_type_ids(base_model, input_ids)
                 if mm_token_type_ids is not None and "image_grid_thw" in forward_kwargs:
                     forward_kwargs["mm_token_type_ids"] = mm_token_type_ids
 
-                with autocast_context(args.generate_amp_dtype):
-                    outputs = model(**forward_kwargs)
-                next_token = sample_next_token(outputs.logits[:, -1, :], args).long()
-                next_token = torch.where(finished, torch.full_like(next_token, pad_token_id), next_token)
-                responses[:, step] = next_token
+            with autocast_context(args.generate_amp_dtype):
+                outputs = model(**forward_kwargs)
+            if use_kv_cache:
+                past_key_values = getattr(outputs, "past_key_values", None)
+            next_token = sample_next_token(outputs.logits[:, -1, :], args).long()
+            next_token = torch.where(finished, torch.full_like(next_token, pad_token_id), next_token)
+            responses[:, step] = next_token
 
-                token_attention = (~finished).long()
-                sequences = torch.cat([sequences, next_token.unsqueeze(1)], dim=1)
-                attention_mask = torch.cat([attention_mask, token_attention.unsqueeze(1)], dim=1)
-                if eos_token_id is not None:
-                    finished = finished | next_token.eq(int(eos_token_id))
+            token_attention = (~finished).long()
+            sequences = torch.cat([sequences, next_token.unsqueeze(1)], dim=1)
+            attention_mask = torch.cat([attention_mask, token_attention.unsqueeze(1)], dim=1)
+            if eos_token_id is not None:
+                finished = finished | next_token.eq(int(eos_token_id))
 
-                # FSDP forward contains collectives, so all ranks must run the same
-                # number of generation iterations. Only stop early when every rank
-                # has finished all of its local samples.
-                local_done = torch.tensor(
-                    1 if bool(finished.all().item()) else 0,
-                    dtype=torch.int32,
-                    device=device,
-                )
-                dist.all_reduce(local_done, op=dist.ReduceOp.MIN)
-                if int(local_done.item()) == 1:
-                    break
+            # FSDP forward contains collectives, so all ranks must run the same
+            # number of generation iterations. Only stop early when every rank
+            # has finished all of its local samples.
+            local_done = torch.tensor(
+                1 if bool(finished.all().item()) else 0,
+                dtype=torch.int32,
+                device=device,
+            )
+            dist.all_reduce(local_done, op=dist.ReduceOp.MIN)
+            if int(local_done.item()) == 1:
+                break
 
     if was_training:
         model.train()
@@ -511,9 +453,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--response-width", type=int, default=512)
     parser.add_argument(
         "--rollout-backend",
-        choices=("manual", "hf_generate"),
+        choices=("manual", "manual_cache", "hf_generate"),
         default="manual",
-        help="manual is slower but fully sharded; hf_generate gathers full params and uses HF KV-cache generation.",
+        help=(
+            "manual recomputes the full sequence every token; manual_cache uses FSDP forward with KV cache; "
+            "hf_generate is kept as a compatibility alias for manual_cache."
+        ),
     )
     parser.add_argument("--rollout-do-sample", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--rollout-temperature", type=float, default=1.0)
@@ -570,7 +515,7 @@ def main() -> None:
     ) = parse_yaml_args(args.config)
     if args.learning_rate is not None:
         optimizer_args = replace(optimizer_args, learning_rate=args.learning_rate)
-    model_args = replace(model_args, use_cache=False)
+    model_args = replace(model_args, use_cache=args.rollout_backend in {"manual_cache", "hf_generate"})
     if args.gradient_checkpointing and hasattr(model_args, "gradient_checkpointing"):
         model_args = replace(model_args, gradient_checkpointing=True)
 
