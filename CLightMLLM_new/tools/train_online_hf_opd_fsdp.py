@@ -681,6 +681,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--rollout-top-p", type=float, default=1.0)
     parser.add_argument("--rollout-top-k", type=int, default=-1)
     parser.add_argument("--student-vllm-dtype", default="bfloat16")
+    parser.add_argument(
+        "--student-vllm-device",
+        default=None,
+        help=(
+            "CUDA device for rank0 student vLLM. Defaults to rank0's training device. "
+            "For a dedicated 5th visible GPU, launch with five CUDA_VISIBLE_DEVICES entries "
+            "and pass --student-vllm-device cuda:4."
+        ),
+    )
     parser.add_argument("--student-vllm-gpu-memory-utilization", type=float, default=0.25)
     parser.add_argument("--student-vllm-max-model-len", type=int, default=1537)
     parser.add_argument("--student-vllm-max-num-batched-tokens", type=int, default=None)
@@ -800,7 +809,7 @@ def main() -> None:
             max_num_batched_tokens=args.student_vllm_max_num_batched_tokens,
             max_num_seqs=args.student_vllm_max_num_seqs,
             enforce_eager=args.student_vllm_enforce_eager,
-            device=f"cuda:{local_rank}",
+            device=args.student_vllm_device or f"cuda:{local_rank}",
             disable_log_stats=True,
             seed=0,
             limit_mm_per_prompt={"image": 1, "video": 0},
@@ -823,6 +832,7 @@ def main() -> None:
     rank_print(f"rollout_backend={args.rollout_backend}")
     if args.rollout_backend in {"vllm_single", "vllm_ipc"}:
         rank_print(f"student_vllm_dtype={args.student_vllm_dtype}")
+        rank_print(f"student_vllm_device={args.student_vllm_device or f'cuda:{local_rank}'}")
         rank_print(f"student_vllm_gpu_memory_utilization={args.student_vllm_gpu_memory_utilization}")
         rank_print(f"student_vllm_max_model_len={args.student_vllm_max_model_len}")
         if args.rollout_backend == "vllm_ipc":
