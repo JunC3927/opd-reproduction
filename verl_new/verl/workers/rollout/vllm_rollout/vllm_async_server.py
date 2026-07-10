@@ -176,6 +176,7 @@ class vLLMHttpServer:
         self._server_port = None
         self._opd_vllm_prompt_dump_count = 0
         self._opd_teacher_io_dump_count = 0
+        self._opd_student_rollout_io_dump_count = 0
 
         # used for controlling vllm server profiler
         profiler_config = self.config.profiler
@@ -642,6 +643,20 @@ class vLLMHttpServer:
         if hasattr(final_res.outputs[0], "num_preempted"):
             num_preempted = final_res.outputs[0].num_preempted
 
+        self._maybe_dump_opd_student_rollout_io(
+            request_id=request_id,
+            upstream_request_id=upstream_request_id,
+            original_prompt_ids=original_prompt_ids,
+            prompt_kwargs=prompt_kwargs,
+            sampling_params=sampling_params,
+            generated_token_ids=token_ids,
+            log_probs=log_probs,
+            finish_reason=finish_reason,
+            stop_reason=stop_reason,
+            num_preempted=num_preempted,
+            extra_fields=extra_fields,
+        )
+
         # Re-key backend spec-decoding stats to the rollout-common names.
         if self.config.mtp is not None and self.config.mtp.enable and self.config.mtp.enable_rollout:
             spec_decode_stats = getattr(final_res.metrics, "request_spec_decode_stats", None)
@@ -663,6 +678,82 @@ class vLLMHttpServer:
             stop_reason=stop_reason,
             num_preempted=num_preempted,
             extra_fields=extra_fields,
+        )
+
+    def _maybe_dump_opd_student_rollout_io(
+        self,
+        *,
+        request_id: str,
+        upstream_request_id: Optional[str],
+        original_prompt_ids: list[int],
+        prompt_kwargs: dict[str, Any],
+        sampling_params: SamplingParams,
+        generated_token_ids: list[int],
+        log_probs: Optional[list[float]],
+        finish_reason: str | None,
+        stop_reason: str | None,
+        num_preempted: int | None,
+        extra_fields: dict[str, Any],
+    ) -> None:
+        dump_dir = os.getenv("VERL_OPD_STUDENT_ROLLOUT_IO_DUMP_DIR")
+        if not dump_dir:
+            return
+
+        # Teacher top-k scoring also flows through this generate() method. It sets
+        # prompt_logprobs, while student rollout generation does not.
+        if getattr(sampling_params, "prompt_logprobs", None) is not None:
+            return
+
+        limit = int(os.getenv("VERL_OPD_STUDENT_ROLLOUT_IO_DUMP_LIMIT", "0") or "0")
+        if limit <= 0 or self._opd_student_rollout_io_dump_count >= limit:
+            return
+
+        dump_index = self._opd_student_rollout_io_dump_count
+        self._opd_student_rollout_io_dump_count += 1
+        os.makedirs(dump_dir, exist_ok=True)
+        prompt_token_ids = prompt_kwargs.get("prompt_token_ids") or []
+        multi_modal_data = prompt_kwargs.get("multi_modal_data") or {}
+        payload = {
+            "format": "verl_student_vllm_io_v1",
+            "dump_index": dump_index,
+            "request_id": request_id,
+            "vllm_request_id": request_id,
+            "upstream_request_id": upstream_request_id,
+            "pid": os.getpid(),
+            "replica_rank": self.replica_rank,
+            "node_rank": self.node_rank,
+            "global_steps": self.global_steps,
+            "input": {
+                "prompt_kwargs": _opd_vllm_prompt_to_cpu(prompt_kwargs),
+                "original_prompt_token_ids": [int(token_id) for token_id in original_prompt_ids],
+                "original_prompt_len": len(original_prompt_ids),
+                "prompt_token_ids": [int(token_id) for token_id in prompt_token_ids],
+                "prompt_len": len(prompt_token_ids),
+                "dedup_prompt_len_delta": len(original_prompt_ids) - len(prompt_token_ids),
+                "sampling_params": _opd_sampling_params_to_dict(sampling_params),
+                "image_count": len(multi_modal_data.get("image") or []),
+                "video_count": len(multi_modal_data.get("video") or []),
+                "audio_count": len(multi_modal_data.get("audio") or []),
+                "has_mm_processor_kwargs": "mm_processor_kwargs" in prompt_kwargs,
+            },
+            "output": {
+                "generated_token_ids": [int(token_id) for token_id in generated_token_ids],
+                "generated_len": len(generated_token_ids),
+                "log_probs": _opd_vllm_prompt_to_cpu(log_probs),
+                "finish_reason": finish_reason,
+                "stop_reason": stop_reason,
+                "num_preempted": num_preempted,
+                "extra_fields": _opd_vllm_prompt_to_cpu(extra_fields),
+            },
+        }
+        dump_path = os.path.join(dump_dir, f"student_vllm_io_pid{os.getpid()}_idx{dump_index:05d}.pt")
+        torch.save(payload, dump_path)
+        print(
+            f"Saved VERL student vLLM IO dump to {dump_path}; "
+            f"dump_index={dump_index}; prompt_len={payload['input']['prompt_len']}; "
+            f"response_len={payload['output']['generated_len']}; "
+            f"image_count={payload['input']['image_count']}",
+            flush=True,
         )
 
     def _maybe_dump_opd_vllm_prompt(
