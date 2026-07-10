@@ -3,7 +3,7 @@ import json
 import os
 import re
 import sys
-from contextlib import nullcontext
+from contextlib import ExitStack, contextmanager, nullcontext
 from dataclasses import replace
 from functools import partial
 from pathlib import Path
@@ -11,6 +11,7 @@ from typing import Any
 
 import torch
 import torch.distributed as dist
+from transformers import GenerationConfig
 from torch.distributed.fsdp import (
     BackwardPrefetch,
     FullyShardedDataParallel as FSDP,
@@ -180,6 +181,56 @@ def completion_mask(responses: torch.Tensor, *, pad_token_id: int, eos_token_id:
     return mask.long()
 
 
+@contextmanager
+def summon_fsdp_full_params_for_generate(model: FSDP):
+    fsdp_modules = []
+    seen: set[int] = set()
+    for module in model.modules():
+        if isinstance(module, FSDP) and id(module) not in seen:
+            fsdp_modules.append(module)
+            seen.add(id(module))
+
+    with ExitStack() as stack:
+        for module in fsdp_modules:
+            stack.enter_context(FSDP.summon_full_params(module, writeback=False, recurse=False))
+        yield
+
+
+def hf_generation_config(args: argparse.Namespace, tokenizer: Any) -> GenerationConfig:
+    kwargs = {
+        "max_new_tokens": int(args.response_width),
+        "do_sample": bool(args.rollout_do_sample),
+        "temperature": float(args.rollout_temperature),
+        "top_p": float(args.rollout_top_p),
+        "top_k": int(args.rollout_top_k),
+        "pad_token_id": int(tokenizer.pad_token_id),
+        "eos_token_id": getattr(tokenizer, "eos_token_id", None),
+        "use_cache": True,
+    }
+    if kwargs["top_k"] <= 0:
+        kwargs["top_k"] = 0
+    return GenerationConfig(**kwargs)
+
+
+def pad_or_truncate_responses(
+    responses: torch.Tensor,
+    *,
+    response_width: int,
+    pad_token_id: int,
+) -> torch.Tensor:
+    if responses.shape[1] > response_width:
+        return responses[:, :response_width]
+    if responses.shape[1] == response_width:
+        return responses
+    pad = torch.full(
+        (responses.shape[0], response_width - responses.shape[1]),
+        pad_token_id,
+        dtype=responses.dtype,
+        device=responses.device,
+    )
+    return torch.cat([responses, pad], dim=1)
+
+
 def generate_local_sequences(
     *,
     model: FSDP,
@@ -217,40 +268,58 @@ def generate_local_sequences(
     pad_token_id = int(tokenizer.pad_token_id)
 
     with torch.no_grad():
-        for step in range(response_width):
+        if args.rollout_backend == "hf_generate":
             forward_kwargs: dict[str, Any] = {
                 "input_ids": sequences,
                 "attention_mask": attention_mask,
-                "use_cache": False,
             }
             forward_kwargs.update(build_mm_kwargs(mm_inputs, row_start, row_end, device))
-            mm_token_type_ids = build_mm_token_type_ids(base_model, sequences)
-            if mm_token_type_ids is not None and "image_grid_thw" in forward_kwargs:
-                forward_kwargs["mm_token_type_ids"] = mm_token_type_ids
-
-            with autocast_context(args.generate_amp_dtype):
-                outputs = model(**forward_kwargs)
-            next_token = sample_next_token(outputs.logits[:, -1, :], args).long()
-            next_token = torch.where(finished, torch.full_like(next_token, pad_token_id), next_token)
-            responses[:, step] = next_token
-
-            token_attention = (~finished).long()
-            sequences = torch.cat([sequences, next_token.unsqueeze(1)], dim=1)
-            attention_mask = torch.cat([attention_mask, token_attention.unsqueeze(1)], dim=1)
-            if eos_token_id is not None:
-                finished = finished | next_token.eq(int(eos_token_id))
-
-            # FSDP forward contains collectives, so all ranks must run the same
-            # number of generation iterations. Only stop early when every rank
-            # has finished all of its local samples.
-            local_done = torch.tensor(
-                1 if bool(finished.all().item()) else 0,
-                dtype=torch.int32,
-                device=device,
+            with summon_fsdp_full_params_for_generate(model):
+                with autocast_context(args.generate_amp_dtype):
+                    generated = model.module.generate(
+                        **forward_kwargs,
+                        generation_config=hf_generation_config(args, tokenizer),
+                    )
+            responses = pad_or_truncate_responses(
+                generated[:, prompt_width:],
+                response_width=response_width,
+                pad_token_id=pad_token_id,
             )
-            dist.all_reduce(local_done, op=dist.ReduceOp.MIN)
-            if int(local_done.item()) == 1:
-                break
+        else:
+            for step in range(response_width):
+                forward_kwargs = {
+                    "input_ids": sequences,
+                    "attention_mask": attention_mask,
+                    "use_cache": False,
+                }
+                forward_kwargs.update(build_mm_kwargs(mm_inputs, row_start, row_end, device))
+                mm_token_type_ids = build_mm_token_type_ids(base_model, sequences)
+                if mm_token_type_ids is not None and "image_grid_thw" in forward_kwargs:
+                    forward_kwargs["mm_token_type_ids"] = mm_token_type_ids
+
+                with autocast_context(args.generate_amp_dtype):
+                    outputs = model(**forward_kwargs)
+                next_token = sample_next_token(outputs.logits[:, -1, :], args).long()
+                next_token = torch.where(finished, torch.full_like(next_token, pad_token_id), next_token)
+                responses[:, step] = next_token
+
+                token_attention = (~finished).long()
+                sequences = torch.cat([sequences, next_token.unsqueeze(1)], dim=1)
+                attention_mask = torch.cat([attention_mask, token_attention.unsqueeze(1)], dim=1)
+                if eos_token_id is not None:
+                    finished = finished | next_token.eq(int(eos_token_id))
+
+                # FSDP forward contains collectives, so all ranks must run the same
+                # number of generation iterations. Only stop early when every rank
+                # has finished all of its local samples.
+                local_done = torch.tensor(
+                    1 if bool(finished.all().item()) else 0,
+                    dtype=torch.int32,
+                    device=device,
+                )
+                dist.all_reduce(local_done, op=dist.ReduceOp.MIN)
+                if int(local_done.item()) == 1:
+                    break
 
     if was_training:
         model.train()
@@ -412,6 +481,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--samples-per-update", type=int, default=12)
     parser.add_argument("--micro-batch-size", type=int, default=1)
     parser.add_argument("--response-width", type=int, default=512)
+    parser.add_argument(
+        "--rollout-backend",
+        choices=("manual", "hf_generate"),
+        default="manual",
+        help="manual is slower but fully sharded; hf_generate gathers full params and uses HF KV-cache generation.",
+    )
     parser.add_argument("--rollout-do-sample", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--rollout-temperature", type=float, default=1.0)
     parser.add_argument("--rollout-top-p", type=float, default=1.0)
@@ -515,6 +590,7 @@ def main() -> None:
     rank_print(f"micro_batch_size={args.micro_batch_size}")
     rank_print(f"epochs={args.epochs}")
     rank_print(f"response_width={args.response_width}")
+    rank_print(f"rollout_backend={args.rollout_backend}")
     rank_print(f"teacher={args.teacher_host}:{args.teacher_port}")
     rank_print(f"generate_amp_dtype={args.generate_amp_dtype}")
     rank_print(f"train_amp_dtype={args.train_amp_dtype}")
