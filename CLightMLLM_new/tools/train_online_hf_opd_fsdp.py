@@ -11,7 +11,6 @@ from typing import Any
 
 import torch
 import torch.distributed as dist
-from transformers import GenerationConfig
 from torch.distributed.fsdp import (
     BackwardPrefetch,
     FullyShardedDataParallel as FSDP,
@@ -196,7 +195,7 @@ def summon_fsdp_full_params_for_generate(model: FSDP):
         yield
 
 
-def hf_generation_config(args: argparse.Namespace, tokenizer: Any) -> GenerationConfig:
+def hf_generate_kwargs(args: argparse.Namespace, tokenizer: Any) -> dict[str, Any]:
     kwargs = {
         "max_new_tokens": int(args.response_width),
         "do_sample": bool(args.rollout_do_sample),
@@ -209,7 +208,37 @@ def hf_generation_config(args: argparse.Namespace, tokenizer: Any) -> Generation
     }
     if kwargs["top_k"] <= 0:
         kwargs["top_k"] = 0
-    return GenerationConfig(**kwargs)
+    if dist.is_initialized():
+        kwargs["synced_gpus"] = True
+    return kwargs
+
+
+@contextmanager
+def temporary_generation_config_overrides(model: torch.nn.Module, generate_kwargs: dict[str, Any]):
+    generation_config = getattr(model, "generation_config", None)
+    if generation_config is None:
+        yield
+        return
+
+    keys = (
+        "max_new_tokens",
+        "do_sample",
+        "temperature",
+        "top_p",
+        "top_k",
+        "pad_token_id",
+        "eos_token_id",
+        "use_cache",
+    )
+    old_values = {key: getattr(generation_config, key, None) for key in keys}
+    for key in keys:
+        if key in generate_kwargs:
+            setattr(generation_config, key, generate_kwargs[key])
+    try:
+        yield
+    finally:
+        for key, value in old_values.items():
+            setattr(generation_config, key, value)
 
 
 def pad_or_truncate_responses(
@@ -276,10 +305,9 @@ def generate_local_sequences(
             forward_kwargs.update(build_mm_kwargs(mm_inputs, row_start, row_end, device))
             with summon_fsdp_full_params_for_generate(model):
                 with autocast_context(args.generate_amp_dtype):
-                    generated = model.module.generate(
-                        **forward_kwargs,
-                        generation_config=hf_generation_config(args, tokenizer),
-                    )
+                    generate_kwargs = hf_generate_kwargs(args, tokenizer)
+                    with temporary_generation_config_overrides(model.module, generate_kwargs):
+                        generated = model.module.generate(**forward_kwargs, **generate_kwargs)
             responses = pad_or_truncate_responses(
                 generated[:, prompt_width:],
                 response_width=response_width,
