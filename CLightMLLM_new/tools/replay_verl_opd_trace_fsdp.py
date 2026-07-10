@@ -29,7 +29,6 @@ from replay_verl_opd_trace import (  # noqa: E402
     build_optimizer,
     build_position_ids,
     compute_topk_loss_from_logits,
-    compute_update_stats,
     expand_paths,
     finish_swanlab,
     init_swanlab,
@@ -41,7 +40,6 @@ from replay_verl_opd_trace import (  # noqa: E402
     optimizer_state_dtype_counts,
     parse_yaml_args,
     sanitize_teacher_ids,
-    select_update_probe,
     sync_cuda,
     trainable_parameter_summary,
     validate_token_ids,
@@ -119,8 +117,8 @@ def save_fsdp_hf_model(model: FSDP, base_model: torch.nn.Module, processor: Any,
 def select_fsdp_update_probes(
     model: torch.nn.Module,
     *,
-    samples_per_param: int = 2048,
-    max_params: int = 32,
+    samples_per_param: int = 64,
+    max_params: int = 1,
 ) -> list[tuple[str, torch.Tensor, torch.Tensor]]:
     probes: list[tuple[str, torch.Tensor, torch.Tensor]] = []
     for name, param in model.named_parameters():
@@ -146,6 +144,12 @@ def compute_fsdp_update_stats(
     model: torch.nn.Module,
     probes: list[tuple[str, torch.Tensor, torch.Tensor]],
 ) -> dict[str, float]:
+    if not probes:
+        return {
+            "param_update_max_abs": float("nan"),
+            "param_update_mean_abs": float("nan"),
+            "param_update_rel_mean": float("nan"),
+        }
     params = dict(model.named_parameters())
     device = probes[0][1].device
     local_max = torch.tensor(0.0, device=device)
@@ -177,6 +181,12 @@ def compute_fsdp_update_stats(
         "param_update_mean_abs": float(mean_abs.detach().cpu().item()),
         "param_update_rel_mean": float((mean_abs / before_mean_abs.clamp_min(1e-12)).detach().cpu().item()),
     }
+
+
+def format_update_probe_names(probes: list[tuple[str, torch.Tensor, torch.Tensor]]) -> str:
+    if not probes:
+        return ""
+    return ",".join(name for name, _, _ in probes)
 
 
 def main() -> None:
@@ -221,6 +231,23 @@ def main() -> None:
         "--gradient-checkpointing",
         action="store_true",
         help="Enable model gradient checkpointing before FSDP wrapping.",
+    )
+    parser.add_argument(
+        "--disable-update-probe",
+        action="store_true",
+        help="Skip sampled parameter-delta diagnostics. This does not affect training.",
+    )
+    parser.add_argument(
+        "--update-probe-samples",
+        type=int,
+        default=64,
+        help="Number of values sampled per FSDP local parameter shard for update diagnostics.",
+    )
+    parser.add_argument(
+        "--update-probe-max-params",
+        type=int,
+        default=1,
+        help="Maximum number of FSDP local parameter shards sampled for update diagnostics.",
     )
     args = parser.parse_args()
 
@@ -373,8 +400,14 @@ def main() -> None:
 
             if optimizer is not None:
                 optimizer.zero_grad(set_to_none=True)
-                update_probes = select_fsdp_update_probes(model)
-                sync_cuda(device, f"file {file_idx} select_fsdp_update_probes")
+                if args.disable_update_probe:
+                    update_probes = []
+                else:
+                    update_probes = select_fsdp_update_probes(
+                        model,
+                        samples_per_param=args.update_probe_samples,
+                        max_params=args.update_probe_max_params,
+                    )
             else:
                 update_probes = []
 
@@ -529,7 +562,7 @@ def main() -> None:
                 }
                 if args.train:
                     record["grad_norm"] = float(grad_value.detach().cpu().item())
-                    record["update_param"] = probe_name
+                    record["update_param"] = format_update_probe_names(update_probes)
                     record.update(update_stats)
                 if meta:
                     global_token_num = meta.get("global_token_num")
@@ -552,7 +585,7 @@ def main() -> None:
                 ]
                 if args.train:
                     parts.append(f"grad_norm={record['grad_norm']:.8f}")
-                    parts.append(f"update_param={probe_name}")
+                    parts.append(f"update_param={record['update_param']}")
                     for key in ("param_update_max_abs", "param_update_mean_abs", "param_update_rel_mean"):
                         if key in record:
                             parts.append(f"{key}={record[key]:.8e}")
