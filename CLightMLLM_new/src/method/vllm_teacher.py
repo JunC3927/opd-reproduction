@@ -280,6 +280,14 @@ class VLLMTeacherScorer:
             return int(attention_mask.numel())
         return int(active[0].item())
 
+    @staticmethod
+    def _active_span(attention_mask: torch.Tensor) -> tuple[int, int]:
+        active = torch.nonzero(attention_mask.bool(), as_tuple=False).flatten()
+        if active.numel() == 0:
+            length = int(attention_mask.numel())
+            return length, length
+        return int(active[0].item()), int(active[-1].item()) + 1
+
     def _extract_topk(self, output: Any, expected_len: int) -> tuple[torch.Tensor, torch.Tensor]:
         prompt_logprobs = getattr(output, "prompt_logprobs", None)
         if prompt_logprobs is None:
@@ -389,6 +397,7 @@ class VLLMTeacherScorer:
         model_kwargs: dict[str, Any] | None = None,
         mm_processor_kwargs_per_sample: list[dict[str, Any] | None] | None = None,
         multi_modal_data_per_sample: list[dict[str, Any] | None] | None = None,
+        response_mask: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         device = sequences.device
         batch_size, seq_len = sequences.shape
@@ -401,6 +410,22 @@ class VLLMTeacherScorer:
         )
         if seq_len <= 1:
             return full_logps, full_ids
+
+        response_shift_start = None
+        response_mask_cpu = None
+        if response_mask is not None:
+            response_mask_cpu = response_mask.detach().cpu().bool()
+            if response_mask_cpu.ndim != 2 or response_mask_cpu.shape[0] != batch_size:
+                raise RuntimeError(
+                    "Unexpected response_mask shape: "
+                    f"got {tuple(response_mask_cpu.shape)}, expected batch {batch_size}."
+                )
+            response_width = int(response_mask_cpu.shape[1])
+            response_shift_start = seq_len - response_width - 1
+            if response_shift_start < 0:
+                raise RuntimeError(
+                    f"Invalid response_mask width {response_width} for sequence length {seq_len}."
+                )
 
         prompts = []
         spans = []
@@ -426,8 +451,8 @@ class VLLMTeacherScorer:
             multi_modal_data_per_sample.extend([None for _ in range(batch_size - len(multi_modal_data_per_sample))])
 
         for row_idx in range(batch_size):
-            start = self._first_active_index(attention_mask[row_idx])
-            token_ids = sequences[row_idx, start:].detach().cpu().tolist()
+            start, end = self._active_span(attention_mask[row_idx])
+            token_ids = sequences[row_idx, start:end].detach().cpu().tolist()
             prompt, kept_indices = self._build_prompt(
                 token_ids=token_ids,
                 images=images_per_sample[row_idx],
@@ -436,14 +461,26 @@ class VLLMTeacherScorer:
                 mm_processor_kwargs=mm_processor_kwargs_per_sample[row_idx],
                 multi_modal_data=multi_modal_data_per_sample[row_idx],
             )
+            response_shift_indices = None
+            if response_mask_cpu is not None:
+                assert response_shift_start is not None
+                local_response_positions = torch.nonzero(
+                    response_mask_cpu[row_idx],
+                    as_tuple=False,
+                ).flatten()
+                response_shift_indices = [
+                    int(response_shift_start + position.item())
+                    for position in local_response_positions
+                    if 0 <= int(response_shift_start + position.item()) < max(seq_len - 1, 0)
+                ]
             prompts.append(prompt)
-            spans.append((row_idx, start, len(token_ids), kept_indices))
+            spans.append((row_idx, start, len(token_ids), kept_indices, response_shift_indices))
 
         outputs = self.llm.generate(prompts, self.sampling_params, use_tqdm=False)
         if len(outputs) != len(spans):
             raise RuntimeError(f"vLLM returned {len(outputs)} outputs for {len(spans)} prompts.")
 
-        for output, (row_idx, start, active_len, kept_indices) in zip(outputs, spans):
+        for output, (row_idx, start, active_len, kept_indices, response_shift_indices) in zip(outputs, spans):
             prompt_logprobs = getattr(output, "prompt_logprobs", None)
             if prompt_logprobs is None:
                 raise RuntimeError("vLLM output did not include prompt_logprobs.")
@@ -464,7 +501,30 @@ class VLLMTeacherScorer:
                 )
             logps, ids = self._extract_topk(output, expected_len=output_len)
 
-            if output_len == expanded_len:
+            if response_shift_indices is not None:
+                response_len = len(response_shift_indices)
+                if response_len == 0:
+                    continue
+                if output_len < response_len:
+                    raise RuntimeError(
+                        "Unexpected vLLM prompt_logprobs length for response alignment: "
+                        f"got {output_len}, need at least response tokens {response_len} "
+                        f"(row={row_idx}, active_len={active_len}, kept_len={len(kept_indices)})."
+                    )
+                if os.getenv("CLIGHT_OPD_VLLM_DEBUG") == "1" and is_rank_zero_process():
+                    print(
+                        "OPD vLLM response suffix alignment:",
+                        f"row={row_idx}",
+                        f"output_len={output_len}",
+                        f"response_len={response_len}",
+                        f"first_shift={response_shift_indices[0]}",
+                        f"last_shift={response_shift_indices[-1]}",
+                    )
+                response_logps = logps[-response_len:].to(device)
+                response_ids = ids[-response_len:].to(device)
+                full_logps[row_idx, response_shift_indices] = response_logps
+                full_ids[row_idx, response_shift_indices] = response_ids
+            elif output_len == expanded_len:
                 full_slice = slice(start, start + active_len - 1)
                 full_logps[row_idx, full_slice] = logps.to(device)
                 full_ids[row_idx, full_slice] = ids.to(device)

@@ -66,6 +66,7 @@ class RemoteTeacherScorer:
         model_kwargs: dict[str, Any] | None = None,
         mm_processor_kwargs_per_sample: list[dict[str, Any] | None] | None = None,
         multi_modal_data_per_sample: list[dict[str, Any] | None] | None = None,
+        response_mask: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         device = sequences.device
         cpu_model_kwargs = None
@@ -78,6 +79,7 @@ class RemoteTeacherScorer:
             "op": "score",
             "sequences": sequences.detach().cpu(),
             "attention_mask": attention_mask.detach().cpu(),
+            "response_mask": None if response_mask is None else response_mask.detach().cpu(),
             "images_per_sample": images_per_sample,
             "image_token_id": image_token_id,
             "video_token_id": video_token_id,

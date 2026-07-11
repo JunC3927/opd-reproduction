@@ -42,6 +42,14 @@ def image_count(images_per_sample) -> int:
     return sum(len(images) for images in images_per_sample)
 
 
+def tensor_sum_int(value) -> int | None:
+    if value is None:
+        return None
+    if not hasattr(value, "sum"):
+        return None
+    return int(value.sum().item())
+
+
 class TeacherTCPServer(socketserver.ThreadingTCPServer):
     allow_reuse_address = True
 
@@ -77,6 +85,8 @@ class TeacherHandler(socketserver.BaseRequestHandler):
                         f"[teacher request {request_id}] received op={op} "
                         f"sequences={tensor_shape(request.get('sequences'))} "
                         f"attention_mask={tensor_shape(request.get('attention_mask'))} "
+                        f"response_mask={tensor_shape(request.get('response_mask'))} "
+                        f"response_tokens={tensor_sum_int(request.get('response_mask'))} "
                         f"images={image_count(request.get('images_per_sample'))}",
                         flush=True,
                     )
@@ -115,6 +125,7 @@ class TeacherHandler(socketserver.BaseRequestHandler):
                 logps, ids = server.state.scorer.score(
                     sequences=request["sequences"],
                     attention_mask=request["attention_mask"],
+                    response_mask=request.get("response_mask"),
                     images_per_sample=request.get("images_per_sample"),
                     image_token_id=request.get("image_token_id"),
                     video_token_id=request.get("video_token_id"),

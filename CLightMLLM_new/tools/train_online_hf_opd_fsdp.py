@@ -900,6 +900,7 @@ def batched_teacher_score(
     scorer: RemoteTeacherScorer,
     local_sequences: torch.Tensor,
     local_attention_mask: torch.Tensor,
+    local_response_mask: torch.Tensor,
     local_images: list[list[Any]],
     local_mm_data: list[dict[str, Any] | None],
     local_mm_kwargs: list[dict[str, Any] | None],
@@ -922,6 +923,7 @@ def batched_teacher_score(
     )
     seq_chunks = [torch.empty_like(local_sequences) for _ in range(world_size)]
     mask_chunks = [torch.empty_like(local_attention_mask) for _ in range(world_size)]
+    response_mask_chunks = [torch.empty_like(local_response_mask) for _ in range(world_size)]
     dist.all_gather(seq_chunks, local_sequences.contiguous())
     debug_progress_log(
         args,
@@ -930,6 +932,7 @@ def batched_teacher_score(
         rank0_only=False,
     )
     dist.all_gather(mask_chunks, local_attention_mask.contiguous())
+    dist.all_gather(response_mask_chunks, local_response_mask.contiguous())
     debug_progress_log(
         args,
         f"teacher_gather_masks_done step={update_step}",
@@ -965,6 +968,7 @@ def batched_teacher_score(
     if rank == 0:
         global_sequences = torch.cat(seq_chunks, dim=0)
         global_attention_mask = torch.cat(mask_chunks, dim=0)
+        global_response_mask = torch.cat(response_mask_chunks, dim=0)
         global_images = flatten_gathered(gathered_objects, "images")
         global_mm_kwargs = flatten_gathered(gathered_objects, "mm_kwargs")
         global_mm_data = flatten_gathered(gathered_objects, "mm_data")
@@ -972,12 +976,14 @@ def batched_teacher_score(
         debug_progress_log(
             args,
             f"teacher_rpc_start step={update_step} global_shape={tuple(global_sequences.shape)} "
+            f"global_response_tokens={int(global_response_mask.sum().item())} "
             f"global_images={sum(len(images) for images in global_images)} topk={topk}",
             progress=progress,
         )
         teacher_logps, teacher_ids = scorer.score(
             sequences=global_sequences,
             attention_mask=global_attention_mask,
+            response_mask=global_response_mask,
             images_per_sample=global_images,
             image_token_id=image_token_id,
             video_token_id=video_token_id,
@@ -1579,6 +1585,7 @@ def main() -> None:
                         scorer=scorer,
                         local_sequences=local_sequences,
                         local_attention_mask=local_attention,
+                        local_response_mask=local_response_mask,
                         local_images=local_images,
                         local_mm_data=local_mm_data,
                         local_mm_kwargs=local_mm_kwargs,
