@@ -894,6 +894,9 @@ def flatten_gathered(items: list[Any], key: str) -> list[Any]:
 
 def batched_teacher_score(
     *,
+    args: argparse.Namespace,
+    progress: Any,
+    update_step: int,
     scorer: RemoteTeacherScorer,
     local_sequences: torch.Tensor,
     local_attention_mask: torch.Tensor,
@@ -910,10 +913,29 @@ def batched_teacher_score(
     rank = dist.get_rank()
     local_shape = tuple(local_sequences.shape)
 
+    debug_progress_log(
+        args,
+        f"teacher_gather_start step={update_step} local_shape={local_shape} "
+        f"local_images={sum(len(images) for images in local_images)}",
+        progress=progress,
+        rank0_only=False,
+    )
     seq_chunks = [torch.empty_like(local_sequences) for _ in range(world_size)]
     mask_chunks = [torch.empty_like(local_attention_mask) for _ in range(world_size)]
     dist.all_gather(seq_chunks, local_sequences.contiguous())
+    debug_progress_log(
+        args,
+        f"teacher_gather_sequences_done step={update_step}",
+        progress=progress,
+        rank0_only=False,
+    )
     dist.all_gather(mask_chunks, local_attention_mask.contiguous())
+    debug_progress_log(
+        args,
+        f"teacher_gather_masks_done step={update_step}",
+        progress=progress,
+        rank0_only=False,
+    )
 
     local_objects = {
         "images": local_images,
@@ -921,7 +943,19 @@ def batched_teacher_score(
         "mm_kwargs": local_mm_kwargs,
     }
     gathered_objects: list[Any] = [None for _ in range(world_size)]
+    debug_progress_log(
+        args,
+        f"teacher_gather_objects_start step={update_step}",
+        progress=progress,
+        rank0_only=False,
+    )
     dist.all_gather_object(gathered_objects, local_objects)
+    debug_progress_log(
+        args,
+        f"teacher_gather_objects_done step={update_step}",
+        progress=progress,
+        rank0_only=False,
+    )
 
     local_bsz = local_shape[0]
     seq_len = local_shape[1]
@@ -931,15 +965,31 @@ def batched_teacher_score(
     if rank == 0:
         global_sequences = torch.cat(seq_chunks, dim=0)
         global_attention_mask = torch.cat(mask_chunks, dim=0)
+        global_images = flatten_gathered(gathered_objects, "images")
+        global_mm_kwargs = flatten_gathered(gathered_objects, "mm_kwargs")
+        global_mm_data = flatten_gathered(gathered_objects, "mm_data")
+        rpc_start = time.time()
+        debug_progress_log(
+            args,
+            f"teacher_rpc_start step={update_step} global_shape={tuple(global_sequences.shape)} "
+            f"global_images={sum(len(images) for images in global_images)} topk={topk}",
+            progress=progress,
+        )
         teacher_logps, teacher_ids = scorer.score(
             sequences=global_sequences,
             attention_mask=global_attention_mask,
-            images_per_sample=flatten_gathered(gathered_objects, "images"),
+            images_per_sample=global_images,
             image_token_id=image_token_id,
             video_token_id=video_token_id,
             pad_token_id=pad_token_id,
-            mm_processor_kwargs_per_sample=flatten_gathered(gathered_objects, "mm_kwargs"),
-            multi_modal_data_per_sample=flatten_gathered(gathered_objects, "mm_data"),
+            mm_processor_kwargs_per_sample=global_mm_kwargs,
+            multi_modal_data_per_sample=global_mm_data,
+        )
+        debug_progress_log(
+            args,
+            f"teacher_rpc_done step={update_step} global_teacher_shape={tuple(teacher_ids.shape)} "
+            f"seconds={time.time() - rpc_start:.1f}",
+            progress=progress,
         )
         teacher_logps = teacher_logps.to(device=device, dtype=torch.float32).contiguous()
         teacher_ids = teacher_ids.to(device=device, dtype=torch.long).contiguous()
@@ -949,8 +999,20 @@ def batched_teacher_score(
         logp_scatter = None
         id_scatter = None
 
+    debug_progress_log(
+        args,
+        f"teacher_scatter_start step={update_step}",
+        progress=progress,
+        rank0_only=False,
+    )
     dist.scatter(local_logps, scatter_list=logp_scatter, src=0)
     dist.scatter(local_ids, scatter_list=id_scatter, src=0)
+    debug_progress_log(
+        args,
+        f"teacher_scatter_done step={update_step}",
+        progress=progress,
+        rank0_only=False,
+    )
     return local_logps, local_ids
 
 
@@ -1511,6 +1573,9 @@ def main() -> None:
                         progress=progress,
                     )
                     local_teacher_logps, local_teacher_ids = batched_teacher_score(
+                        args=args,
+                        progress=progress,
+                        update_step=update_step,
                         scorer=scorer,
                         local_sequences=local_sequences,
                         local_attention_mask=local_attention,

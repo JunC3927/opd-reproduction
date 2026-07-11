@@ -3,6 +3,7 @@ import os
 import socketserver
 import sys
 import threading
+import time
 import traceback
 
 
@@ -15,9 +16,30 @@ from src.method.vllm_teacher import VLLMTeacherScorer  # noqa: E402
 
 
 class TeacherState:
-    def __init__(self, scorer: VLLMTeacherScorer) -> None:
+    def __init__(self, scorer: VLLMTeacherScorer, *, log_requests: bool) -> None:
         self.scorer = scorer
+        self.log_requests = log_requests
         self.lock = threading.Lock()
+        self.request_lock = threading.Lock()
+        self.request_count = 0
+
+    def next_request_id(self) -> int:
+        with self.request_lock:
+            self.request_count += 1
+            return self.request_count
+
+
+def tensor_shape(value) -> tuple[int, ...] | None:
+    shape = getattr(value, "shape", None)
+    if shape is None:
+        return None
+    return tuple(int(dim) for dim in shape)
+
+
+def image_count(images_per_sample) -> int:
+    if images_per_sample is None:
+        return 0
+    return sum(len(images) for images in images_per_sample)
 
 
 class TeacherTCPServer(socketserver.ThreadingTCPServer):
@@ -42,12 +64,43 @@ class TeacherHandler(socketserver.BaseRequestHandler):
 
             server = self.server
             assert isinstance(server, TeacherTCPServer)
+            request_id = server.state.next_request_id()
+            if server.state.log_requests:
+                if op == "score_prompt_requests":
+                    print(
+                        f"[teacher request {request_id}] received op={op} "
+                        f"requests={len(request.get('requests', []))}",
+                        flush=True,
+                    )
+                else:
+                    print(
+                        f"[teacher request {request_id}] received op={op} "
+                        f"sequences={tensor_shape(request.get('sequences'))} "
+                        f"attention_mask={tensor_shape(request.get('attention_mask'))} "
+                        f"images={image_count(request.get('images_per_sample'))}",
+                        flush=True,
+                    )
+            lock_wait_start = time.time()
             with server.state.lock:
+                if server.state.log_requests:
+                    print(
+                        f"[teacher request {request_id}] scoring_start "
+                        f"lock_wait_sec={time.time() - lock_wait_start:.3f}",
+                        flush=True,
+                    )
+                score_start = time.time()
                 if op == "score_prompt_requests":
                     logps, ids, lengths = server.state.scorer.score_prompt_requests(
                         requests=request["requests"],
                         pad_token_id=request["pad_token_id"],
                     )
+                    if server.state.log_requests:
+                        print(
+                            f"[teacher request {request_id}] scoring_done "
+                            f"logps={tensor_shape(logps)} ids={tensor_shape(ids)} "
+                            f"seconds={time.time() - score_start:.1f}",
+                            flush=True,
+                        )
                     send_message(
                         self.request,
                         {
@@ -69,6 +122,13 @@ class TeacherHandler(socketserver.BaseRequestHandler):
                     mm_processor_kwargs_per_sample=request.get("mm_processor_kwargs_per_sample"),
                     multi_modal_data_per_sample=request.get("multi_modal_data_per_sample"),
                 )
+                if server.state.log_requests:
+                    print(
+                        f"[teacher request {request_id}] scoring_done "
+                        f"logps={tensor_shape(logps)} ids={tensor_shape(ids)} "
+                        f"seconds={time.time() - score_start:.1f}",
+                        flush=True,
+                    )
                 send_message(
                     self.request,
                     {
@@ -78,6 +138,7 @@ class TeacherHandler(socketserver.BaseRequestHandler):
                     },
                 )
         except Exception:
+            print("[teacher request] failed:\n" + traceback.format_exc(), flush=True)
             send_message(self.request, {"ok": False, "error": traceback.format_exc()})
 
 
@@ -111,6 +172,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--image-min-pixels", type=int, default=None)
     parser.add_argument("--image-max-pixels", type=int, default=None)
     parser.add_argument("--dedup-mm-tokens", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument(
+        "--log-requests",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Print one-line request lifecycle logs for teacher scoring RPCs.",
+    )
     parser.set_defaults(
         enable_chunked_prefill=None,
         enable_prefix_caching=None,
@@ -138,6 +205,7 @@ def main() -> None:
         f"image_min_pixels={args.image_min_pixels}",
         f"image_max_pixels={args.image_max_pixels}",
         f"dedup_mm_tokens={args.dedup_mm_tokens}",
+        f"log_requests={args.log_requests}",
         f"CUDA_VISIBLE_DEVICES={os.environ.get('CUDA_VISIBLE_DEVICES')}",
         flush=True,
     )
@@ -170,7 +238,7 @@ def main() -> None:
         image_max_pixels=args.image_max_pixels,
         dedup_mm_tokens=args.dedup_mm_tokens,
     )
-    state = TeacherState(scorer)
+    state = TeacherState(scorer, log_requests=args.log_requests)
     with TeacherTCPServer((args.host, args.port), TeacherHandler, state) as server:
         print(f"CLight shared vLLM teacher listening on {args.host}:{args.port}", flush=True)
         server.serve_forever()
