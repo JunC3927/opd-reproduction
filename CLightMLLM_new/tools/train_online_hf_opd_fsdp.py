@@ -1053,7 +1053,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--rollout-backend",
         choices=("manual", "manual_cache", "hf_generate", "vllm_single", "vllm_ipc"),
-        default="manual",
+        default="manual_cache",
         help=(
             "manual recomputes the full sequence every token; manual_cache uses FSDP forward with KV cache; "
             "hf_generate is kept as a compatibility alias for manual_cache; "
