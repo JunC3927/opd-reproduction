@@ -175,7 +175,7 @@ def make_verl_parquet_config(args: argparse.Namespace) -> Any:
             "filter_overlong_prompts": bool(args.parquet_filter_overlong_prompts),
             "filter_overlong_prompts_workers": int(args.parquet_filter_workers),
             "return_multi_modal_inputs": True,
-            "shuffle": False,
+            "shuffle": bool(args.parquet_shuffle),
             "apply_chat_template_kwargs": parse_json_object(
                 args.parquet_apply_chat_template_kwargs,
                 arg_name="--parquet-apply-chat-template-kwargs",
@@ -391,14 +391,20 @@ def iter_geo3k_parquet_payloads(
     progress: Any = None,
 ) -> Any:
     total = len(dataset)
+    if args.parquet_shuffle:
+        generator = torch.Generator()
+        generator.manual_seed(int(args.parquet_shuffle_seed) + int(epoch))
+        row_indices = torch.randperm(total, generator=generator).tolist()
+    else:
+        row_indices = list(range(total))
     features: list[dict[str, Any]] = []
-    for row_index in range(total):
-        if row_index == 0 or (
-            args.debug_progress_interval > 0 and row_index % args.debug_progress_interval == 0
+    for step_index, row_index in enumerate(row_indices):
+        if step_index == 0 or (
+            args.debug_progress_interval > 0 and step_index % args.debug_progress_interval == 0
         ):
             debug_progress_log(
                 args,
-                f"parquet_encode epoch={epoch} row={row_index}/{total}",
+                f"parquet_encode epoch={epoch} row={step_index}/{total}",
                 progress=progress,
             )
         row = dataset[int(row_index)]
@@ -412,8 +418,8 @@ def iter_geo3k_parquet_payloads(
         if len(features) == samples_per_update:
             debug_progress_log(
                 args,
-                f"parquet_batch_ready epoch={epoch} rows={row_index + 1 - samples_per_update}:{row_index + 1} "
-                f"prompt_width={max(len(item['prompt_input_ids']) for item in features)}",
+                f"parquet_batch_ready epoch={epoch} rows={step_index + 1 - samples_per_update}:{step_index + 1} "
+                f"prompt_width={max(len(item['prompt_input_ids']) for item in features)} shuffle={args.parquet_shuffle}",
                 progress=progress,
             )
             yield features_to_trace_payload(features=features, pad_token_id=pad_token_id)
@@ -914,31 +920,12 @@ def batched_teacher_score(
     rank = dist.get_rank()
     local_shape = tuple(local_sequences.shape)
 
-    debug_progress_log(
-        args,
-        f"teacher_gather_start step={update_step} local_shape={local_shape} "
-        f"local_images={sum(len(images) for images in local_images)}",
-        progress=progress,
-        rank0_only=False,
-    )
     seq_chunks = [torch.empty_like(local_sequences) for _ in range(world_size)]
     mask_chunks = [torch.empty_like(local_attention_mask) for _ in range(world_size)]
     response_mask_chunks = [torch.empty_like(local_response_mask) for _ in range(world_size)]
     dist.all_gather(seq_chunks, local_sequences.contiguous())
-    debug_progress_log(
-        args,
-        f"teacher_gather_sequences_done step={update_step}",
-        progress=progress,
-        rank0_only=False,
-    )
     dist.all_gather(mask_chunks, local_attention_mask.contiguous())
     dist.all_gather(response_mask_chunks, local_response_mask.contiguous())
-    debug_progress_log(
-        args,
-        f"teacher_gather_masks_done step={update_step}",
-        progress=progress,
-        rank0_only=False,
-    )
 
     local_objects = {
         "images": local_images,
@@ -946,19 +933,7 @@ def batched_teacher_score(
         "mm_kwargs": local_mm_kwargs,
     }
     gathered_objects: list[Any] = [None for _ in range(world_size)]
-    debug_progress_log(
-        args,
-        f"teacher_gather_objects_start step={update_step}",
-        progress=progress,
-        rank0_only=False,
-    )
     dist.all_gather_object(gathered_objects, local_objects)
-    debug_progress_log(
-        args,
-        f"teacher_gather_objects_done step={update_step}",
-        progress=progress,
-        rank0_only=False,
-    )
 
     local_bsz = local_shape[0]
     seq_len = local_shape[1]
@@ -1005,20 +980,8 @@ def batched_teacher_score(
         logp_scatter = None
         id_scatter = None
 
-    debug_progress_log(
-        args,
-        f"teacher_scatter_start step={update_step}",
-        progress=progress,
-        rank0_only=False,
-    )
     dist.scatter(local_logps, scatter_list=logp_scatter, src=0)
     dist.scatter(local_ids, scatter_list=id_scatter, src=0)
-    debug_progress_log(
-        args,
-        f"teacher_scatter_done step={update_step}",
-        progress=progress,
-        rank0_only=False,
-    )
     return local_logps, local_ids
 
 
@@ -1143,7 +1106,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--debug-progress",
         action=argparse.BooleanOptionalAction,
-        default=True,
+        default=False,
         help="Print rank-0 stage/timing logs for dataset encoding, rollout, teacher scoring, and train step.",
     )
     parser.add_argument(
@@ -1176,6 +1139,13 @@ def parse_args() -> argparse.Namespace:
         default=True,
     )
     parser.add_argument("--parquet-filter-workers", type=int, default=1)
+    parser.add_argument(
+        "--parquet-shuffle",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Shuffle Geo3K parquet rows once per epoch before grouping samples_per_update rows.",
+    )
+    parser.add_argument("--parquet-shuffle-seed", type=int, default=0)
     parser.add_argument("--parquet-cache-dir", default=None)
     parser.add_argument(
         "--parquet-mm-processor-kwargs",
@@ -1367,6 +1337,8 @@ def main() -> None:
         rank_print(f"parquet_image_key={parquet_dataset_config.image_key}")
         rank_print(f"parquet_max_prompt_length={parquet_dataset_config.max_prompt_length}")
         rank_print(f"parquet_filter_overlong_prompts={parquet_dataset_config.filter_overlong_prompts}")
+        rank_print(f"parquet_shuffle={args.parquet_shuffle}")
+        rank_print(f"parquet_shuffle_seed={args.parquet_shuffle_seed}")
     if args.rollout_backend in {"vllm_single", "vllm_ipc"}:
         rank_print(f"student_vllm_dtype={args.student_vllm_dtype}")
         rank_print(f"student_vllm_device={args.student_vllm_device or f'cuda:{local_rank}'}")

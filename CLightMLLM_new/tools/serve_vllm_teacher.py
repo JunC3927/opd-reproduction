@@ -186,7 +186,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--log-requests",
         action=argparse.BooleanOptionalAction,
-        default=True,
+        default=False,
         help="Print one-line request lifecycle logs for teacher scoring RPCs.",
     )
     parser.set_defaults(
