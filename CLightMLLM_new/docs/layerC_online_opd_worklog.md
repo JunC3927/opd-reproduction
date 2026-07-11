@@ -439,15 +439,13 @@ temperature: 0.7, top_p: 0.8, top_k: 20
 
 ## 当前工作树注意
 
-写这份文档时，本地还有一些未提交/未跟踪文件：
+后来已经清理了一批一次性 debug/check/compare 脚本，以及两个未跟踪的临时运行脚本。清理后仍需单独注意的本地改动是：
 
 ```text
 M  CLightMLLM_new/tools/probe_vllm_update_weight.py
-?? CLightMLLM_new/scripts/run_layerC_online_smoke_a100.sh
-?? verl_new/examples/on_policy_distillation_trainer/run_qwen3_vl_8b_h200_mirun_1gpu_per_node.sh
 ```
 
-这些不是本轮 parquet/文档的核心改动，提交或丢弃前需要单独确认。
+这个 probe 文件是 vLLM 热更新探索相关，不是稳定训练主路径；提交或恢复前需要单独确认。
 
 ## 新对话快速上下文
 
