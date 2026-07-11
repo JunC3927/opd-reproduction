@@ -90,9 +90,26 @@ def progress_write(progress: Any, message: str) -> None:
         print(message, flush=True)
 
 
-def estimate_initial_total_updates(paths: list[str], args: argparse.Namespace) -> int:
+def debug_progress_log(args: argparse.Namespace, message: str, *, progress: Any = None, rank0_only: bool = True) -> None:
+    if not getattr(args, "debug_progress", True):
+        return
+    if rank0_only and not is_rank0():
+        return
+    prefix = time.strftime("%Y-%m-%d %H:%M:%S")
+    rank = int(os.environ.get("RANK", "0"))
+    progress_write(progress, f"[progress {prefix} rank={rank}] {message}")
+
+
+def estimate_initial_total_updates(
+    paths: list[str],
+    args: argparse.Namespace,
+    *,
+    parquet_len: int | None = None,
+) -> int:
     if args.max_updates > 0:
         return int(args.max_updates)
+    if args.data_source == "geo3k_parquet" and parquet_len is not None:
+        return int((parquet_len // args.samples_per_update) * args.epochs)
     # In the VERL trace dump layout used here each chunk file is normally one update.
     # If a file contains multiple update groups, the tqdm total is adjusted after loading it.
     return int(len(paths) * args.epochs)
@@ -344,26 +361,46 @@ def features_to_trace_payload(
     return {"batch": batch, "non_tensor_batch": non_tensor}
 
 
-def iter_geo3k_parquet_payloads(
+def build_geo3k_parquet_dataset(
     *,
     paths: list[str],
-    samples_per_update: int,
     processor: Any,
     tokenizer: Any,
     dataset_config: Any,
-    pad_token_id: int,
     max_rows: int = 0,
 ) -> Any:
-    dataset = RLHFDataset(
+    return RLHFDataset(
         data_files=paths,
         tokenizer=tokenizer,
         processor=processor,
         config=dataset_config,
         max_samples=max_rows if max_rows > 0 else -1,
     )
+
+
+def iter_geo3k_parquet_payloads(
+    *,
+    dataset: Any,
+    samples_per_update: int,
+    processor: Any,
+    tokenizer: Any,
+    dataset_config: Any,
+    pad_token_id: int,
+    args: argparse.Namespace,
+    epoch: int,
+    progress: Any = None,
+) -> Any:
     total = len(dataset)
     features: list[dict[str, Any]] = []
     for row_index in range(total):
+        if row_index == 0 or (
+            args.debug_progress_interval > 0 and row_index % args.debug_progress_interval == 0
+        ):
+            debug_progress_log(
+                args,
+                f"parquet_encode epoch={epoch} row={row_index}/{total}",
+                progress=progress,
+            )
         row = dataset[int(row_index)]
         feature = build_verl_geo3k_feature(
             row=row,
@@ -373,6 +410,12 @@ def iter_geo3k_parquet_payloads(
         )
         features.append(feature)
         if len(features) == samples_per_update:
+            debug_progress_log(
+                args,
+                f"parquet_batch_ready epoch={epoch} rows={row_index + 1 - samples_per_update}:{row_index + 1} "
+                f"prompt_width={max(len(item['prompt_input_ids']) for item in features)}",
+                progress=progress,
+            )
             yield features_to_trace_payload(features=features, pad_token_id=pad_token_id)
             features = []
 
@@ -572,6 +615,12 @@ def generate_local_sequences(
     pad_token_id = int(tokenizer.pad_token_id)
     use_kv_cache = args.rollout_backend in {"manual_cache", "hf_generate"}
     past_key_values = None
+    rollout_start_time = time.time()
+    debug_progress_log(
+        args,
+        f"rollout_local_start rows={row_start}:{row_end} local_bsz={row_end - row_start} "
+        f"prompt_width={prompt_width} response_width={response_width} backend={args.rollout_backend}",
+    )
 
     with torch.no_grad():
         if args.rollout_backend in {"vllm_single", "vllm_ipc"}:
@@ -608,9 +657,16 @@ def generate_local_sequences(
             input_ids = torch.cat([batch["prompts"][row_start:row_end].cpu().long(), responses_cpu], dim=1)
             prompt_attention_mask = batch["attention_mask"][row_start:row_end, :prompt_width].cpu().long()
             attention_mask_cpu = torch.cat([prompt_attention_mask, response_mask], dim=1)
+            debug_progress_log(
+                args,
+                f"rollout_vllm_done rows={row_start}:{row_end} seconds={time.time() - rollout_start_time:.1f} "
+                f"response_tokens={int(response_mask.sum().item())}",
+            )
             return input_ids, attention_mask_cpu, response_mask
 
         for step in range(response_width):
+            if step == 0:
+                debug_progress_log(args, f"generate_token_start rows={row_start}:{row_end}")
             if use_kv_cache and past_key_values is not None:
                 input_ids = sequences[:, -1:]
                 forward_kwargs = {
@@ -651,6 +707,16 @@ def generate_local_sequences(
             if eos_token_id is not None:
                 finished = finished | next_token.eq(int(eos_token_id))
 
+            if args.debug_progress_interval > 0 and (
+                step == 0 or (step + 1) % args.debug_progress_interval == 0 or step + 1 == response_width
+            ):
+                debug_progress_log(
+                    args,
+                    f"generate_token rows={row_start}:{row_end} step={step + 1}/{response_width} "
+                    f"finished_local={int(finished.sum().item())}/{finished.numel()} "
+                    f"elapsed={time.time() - rollout_start_time:.1f}s",
+                )
+
             # FSDP forward contains collectives, so all ranks must run the same
             # number of generation iterations. Only stop early when every rank
             # has finished all of its local samples.
@@ -676,6 +742,11 @@ def generate_local_sequences(
     input_ids = torch.cat([batch["prompts"][row_start:row_end].cpu().long(), responses_cpu], dim=1)
     prompt_attention_mask = batch["attention_mask"][row_start:row_end, :prompt_width].cpu().long()
     attention_mask = torch.cat([prompt_attention_mask, response_mask], dim=1)
+    debug_progress_log(
+        args,
+        f"rollout_local_done rows={row_start}:{row_end} seconds={time.time() - rollout_start_time:.1f} "
+        f"response_tokens={int(response_mask.sum().item())}",
+    )
     return input_ids, attention_mask, response_mask
 
 
@@ -1001,6 +1072,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--fsdp-min-num-params", type=int, default=10_000_000)
     parser.add_argument("--gradient-checkpointing", action="store_true")
     parser.add_argument("--debug-dtypes", action="store_true")
+    parser.add_argument(
+        "--debug-progress",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Print rank-0 stage/timing logs for dataset encoding, rollout, teacher scoring, and train step.",
+    )
+    parser.add_argument(
+        "--debug-progress-interval",
+        type=int,
+        default=32,
+        help="Print progress every N parquet rows / generated tokens. Set <=0 to only print major stages.",
+    )
     parser.add_argument("--no-progress", action="store_true", help="Disable the rank-0 tqdm progress bar.")
     parser.add_argument("--disable-update-probe", action="store_true")
     parser.add_argument("--update-probe-samples", type=int, default=64)
@@ -1164,8 +1247,26 @@ def main() -> None:
         topk=args.topk,
     )
     parquet_dataset_config = None
+    parquet_dataset = None
+    parquet_len: int | None = None
     if args.data_source == "geo3k_parquet":
         parquet_dataset_config = make_verl_parquet_config(args)
+        debug_progress_log(args, f"parquet_dataset_build_start paths={len(paths)}")
+        parquet_build_start = time.time()
+        parquet_dataset = build_geo3k_parquet_dataset(
+            paths=paths,
+            processor=processor,
+            tokenizer=tokenizer,
+            dataset_config=parquet_dataset_config,
+            max_rows=args.parquet_max_rows,
+        )
+        parquet_len = int(len(parquet_dataset))
+        debug_progress_log(
+            args,
+            f"parquet_dataset_build_done rows={parquet_len} "
+            f"updates_per_epoch={parquet_len // args.samples_per_update} "
+            f"seconds={time.time() - parquet_build_start:.1f}",
+        )
     if args.rollout_backend in {"vllm_single", "vllm_ipc"} and is_rank0():
         if student_rollout is None:
             student_rollout = build_student_vllm_rollout(
@@ -1257,7 +1358,7 @@ def main() -> None:
             rank_print("progress_bar=disabled reason=tqdm_not_installed")
         else:
             progress = tqdm(
-                total=estimate_initial_total_updates(paths, args),
+                total=estimate_initial_total_updates(paths, args, parquet_len=parquet_len),
                 desc="online updates",
                 unit="upd",
                 dynamic_ncols=True,
@@ -1271,17 +1372,21 @@ def main() -> None:
             else:
                 if parquet_dataset_config is None:
                     raise RuntimeError("parquet_dataset_config is required for data_source=geo3k_parquet.")
+                if parquet_dataset is None:
+                    raise RuntimeError("parquet_dataset is required for data_source=geo3k_parquet.")
                 source_iter = (
                     (f"geo3k_parquet_chunk{chunk_idx:06d}", payload)
                     for chunk_idx, payload in enumerate(
                         iter_geo3k_parquet_payloads(
-                            paths=paths,
+                            dataset=parquet_dataset,
                             samples_per_update=args.samples_per_update,
                             processor=processor,
                             tokenizer=tokenizer,
                             dataset_config=parquet_dataset_config,
                             pad_token_id=pad_token_id,
-                            max_rows=args.parquet_max_rows,
+                            args=args,
+                            epoch=epoch,
+                            progress=progress,
                         )
                     )
                 )
@@ -1321,6 +1426,14 @@ def main() -> None:
                     row_start = group_start + local_offset_start
                     row_end = group_start + local_offset_end
                     update_step += 1
+                    update_wall_start = time.time()
+                    debug_progress_log(
+                        args,
+                        f"update_start step={update_step} epoch={epoch} source={source_name} "
+                        f"group_rows={group_start}:{group_end} local_rows={row_start}:{row_end} "
+                        f"prompt_width={prompt_width}",
+                        progress=progress,
+                    )
 
                     rollout_metrics: dict[str, float | int | str] = {}
                     if args.rollout_backend == "vllm_single" and student_rollout is not None:
@@ -1353,6 +1466,7 @@ def main() -> None:
                             )
                         )
                     else:
+                        rollout_start_time = time.time()
                         local_sequences_cpu, local_attention_cpu, local_response_mask_cpu = generate_local_sequences(
                             model=model,
                             base_model=base_model,
@@ -1371,6 +1485,14 @@ def main() -> None:
                             video_token_id=video_token_id,
                             args=args,
                         )
+                        rollout_metrics["student_rollout_sec"] = float(time.time() - rollout_start_time)
+                        debug_progress_log(
+                            args,
+                            f"rollout_done step={update_step} local_shape={tuple(local_sequences_cpu.shape)} "
+                            f"local_response_tokens={int(local_response_mask_cpu.sum().item())} "
+                            f"seconds={rollout_metrics['student_rollout_sec']:.1f}",
+                            progress=progress,
+                        )
                     seq_len = int(local_sequences_cpu.shape[1])
                     local_sequences = local_sequences_cpu.to(device)
                     local_attention = local_attention_cpu.to(device)
@@ -1381,6 +1503,13 @@ def main() -> None:
                         row_end=row_end,
                     )
 
+                    teacher_start_time = time.time()
+                    debug_progress_log(
+                        args,
+                        f"teacher_score_start step={update_step} local_seq_shape={tuple(local_sequences.shape)} "
+                        f"local_images={sum(len(images) for images in local_images)}",
+                        progress=progress,
+                    )
                     local_teacher_logps, local_teacher_ids = batched_teacher_score(
                         scorer=scorer,
                         local_sequences=local_sequences,
@@ -1393,6 +1522,13 @@ def main() -> None:
                         pad_token_id=int(tokenizer.pad_token_id),
                         topk=args.topk,
                         device=device,
+                    )
+                    teacher_sec = time.time() - teacher_start_time
+                    debug_progress_log(
+                        args,
+                        f"teacher_score_done step={update_step} teacher_shape={tuple(local_teacher_ids.shape)} "
+                        f"seconds={teacher_sec:.1f}",
+                        progress=progress,
                     )
                     validate_token_ids(
                         f"online step {update_step} generated input_ids local",
@@ -1422,6 +1558,13 @@ def main() -> None:
                     if response_start < 0:
                         raise ValueError(f"Invalid response_start={response_start}.")
 
+                    train_start_time = time.time()
+                    debug_progress_log(
+                        args,
+                        f"train_backward_start step={update_step} local_bsz={local_sequences.shape[0]} "
+                        f"seq_len={local_sequences.shape[1]} micro_batch_size={args.micro_batch_size}",
+                        progress=progress,
+                    )
                     for local_start in range(0, local_sequences.shape[0], args.micro_batch_size):
                         local_end = min(local_start + args.micro_batch_size, local_sequences.shape[0])
                         input_ids = local_sequences[local_start:local_end]
@@ -1517,6 +1660,12 @@ def main() -> None:
 
                         micro_loss.backward()
                         sync_cuda(device, f"online step {update_step} rows {abs_start}:{abs_end} backward")
+                        debug_progress_log(
+                            args,
+                            f"micro_backward_done step={update_step} rows={abs_start}:{abs_end} "
+                            f"micro_loss={float(micro_loss.detach().item()):.6f}",
+                            progress=progress,
+                        )
 
                         with torch.no_grad():
                             token_count = response_mask.sum()
@@ -1542,6 +1691,12 @@ def main() -> None:
                     if args.grad_clip is not None and args.grad_clip > 0:
                         grad_value = model.clip_grad_norm_(args.grad_clip).detach()
                     optimizer.step()
+                    train_sec = time.time() - train_start_time
+                    debug_progress_log(
+                        args,
+                        f"optimizer_step_done step={update_step} train_seconds={train_sec:.1f}",
+                        progress=progress,
+                    )
                     if args.debug_dtypes and update_step == 1 and is_rank0():
                         print(
                             f"[dtype] optimizer_state_dtypes_after_step={optimizer_state_dtype_counts(optimizer)}",
@@ -1595,6 +1750,10 @@ def main() -> None:
                             "rollout_backend": args.rollout_backend,
                             "generate_amp_dtype": args.generate_amp_dtype,
                             "train_amp_dtype": args.train_amp_dtype,
+                            "student_rollout_sec": float(rollout_metrics.get("student_rollout_sec", 0.0)),
+                            "teacher_score_sec": float(teacher_sec),
+                            "train_step_sec": float(train_sec),
+                            "update_wall_sec": float(time.time() - update_wall_start),
                         }
                         record.update(rollout_metrics)
                         record.update(update_stats)
@@ -1613,6 +1772,9 @@ def main() -> None:
                                     f"topk_overlap={record['topk_overlap']:.8f}",
                                     f"grad_norm={record['grad_norm']:.8f}",
                                     f"resp_len_mean={record['response_len_mean']:.2f}",
+                                    f"rollout_sec={record['student_rollout_sec']:.1f}",
+                                    f"teacher_sec={record['teacher_score_sec']:.1f}",
+                                    f"train_sec={record['train_step_sec']:.1f}",
                                 ]
                             )
                         )
