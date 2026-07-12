@@ -10,6 +10,17 @@ from lightning.pytorch.strategies import DeepSpeedStrategy
 from lightning.pytorch.utilities.rank_zero import rank_zero_only
 from peft import PeftModel
 
+try:
+    from torch.distributed.fsdp import (
+        FullStateDictConfig,
+        FullyShardedDataParallel as FSDP,
+        StateDictType,
+    )
+except Exception:  # pragma: no cover - FSDP may be unavailable in CPU-only installs.
+    FSDP = None
+    FullStateDictConfig = None
+    StateDictType = None
+
 
 LOGGER = logging.getLogger(__name__)
 rank_zero_info = rank_zero_only(LOGGER.info)
@@ -63,12 +74,74 @@ class HFModelExportCallback(Callback):
                     hf_model = self.prepare_hf_model_for_export(hf_model)
                     hf_model.save_pretrained(self.output_dir)
                     self.processor.save_pretrained(self.output_dir)
+        elif self.save_fsdp_hf_pretrained(trainer, hf_model):
+            pass
         elif trainer.is_global_zero:
             hf_model = self.prepare_hf_model_for_export(hf_model)
             hf_model.save_pretrained(self.output_dir)
             self.processor.save_pretrained(self.output_dir)
 
         trainer.strategy.barrier()
+
+    def save_fsdp_hf_pretrained(self, trainer: L.Trainer, hf_model: torch.nn.Module) -> bool:
+        fsdp_model = self.find_fsdp_module(trainer)
+        if fsdp_model is None:
+            return False
+        if FSDP is None or FullStateDictConfig is None or StateDictType is None:
+            raise RuntimeError("FSDP export was requested, but torch.distributed.fsdp is unavailable.")
+        if self.merge_lora_before_export and isinstance(hf_model, PeftModel):
+            raise NotImplementedError("merge_lora_before_export is not supported for FSDP HF export yet.")
+
+        rank_zero_info("Collecting FSDP full state dict for HF export.")
+        state_cfg = FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
+        with FSDP.state_dict_type(fsdp_model, StateDictType.FULL_STATE_DICT, state_cfg):
+            state_dict = fsdp_model.state_dict()
+
+        try:
+            if trainer.is_global_zero:
+                hf_state_dict = self.strip_lightning_model_prefix(state_dict)
+                rank_zero_info("Saving FSDP HF full state dict with %s tensors.", len(hf_state_dict))
+                hf_model.save_pretrained(self.output_dir, state_dict=hf_state_dict)
+                self.processor.save_pretrained(self.output_dir)
+        finally:
+            state_dict.clear()
+            if "hf_state_dict" in locals():
+                hf_state_dict.clear()
+        return True
+
+    @staticmethod
+    def find_fsdp_module(trainer: L.Trainer) -> torch.nn.Module | None:
+        if FSDP is None:
+            return None
+        candidates = [
+            getattr(getattr(trainer, "strategy", None), "model", None),
+            getattr(trainer, "model", None),
+            getattr(trainer, "lightning_module", None),
+        ]
+        seen: set[int] = set()
+        for candidate in candidates:
+            if candidate is None or id(candidate) in seen:
+                continue
+            seen.add(id(candidate))
+            if isinstance(candidate, FSDP):
+                return candidate
+            modules = getattr(candidate, "modules", None)
+            if callable(modules):
+                for module in modules():
+                    if isinstance(module, FSDP):
+                        return module
+        return None
+
+    @staticmethod
+    def strip_lightning_model_prefix(state_dict: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+        tensor_keys = [key for key, value in state_dict.items() if torch.is_tensor(value)]
+        if tensor_keys and all(key.startswith("model.") for key in tensor_keys):
+            return {
+                key[len("model.") :]: value
+                for key, value in state_dict.items()
+                if torch.is_tensor(value)
+            }
+        return {key: value for key, value in state_dict.items() if torch.is_tensor(value)}
 
 
 class RankZeroWandbFinishCallback(Callback):
