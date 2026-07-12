@@ -60,6 +60,11 @@ method:
     rollout_student_server_sync_dtype: none
     rollout_student_server_summon_rank0_only: true
     rollout_student_server_summon_offload_to_cpu: false
+    rollout_student_server_verify_sync: true
+    rollout_student_server_verify_name: model.language_model.embed_tokens.weight
+    rollout_student_server_verify_numel: 256
+    rollout_student_server_verify_rtol: 5.0e-3
+    rollout_student_server_verify_atol: 5.0e-3
     rollout_num_generations: 1
     rollout_do_sample: true
     rollout_temperature: 1.0

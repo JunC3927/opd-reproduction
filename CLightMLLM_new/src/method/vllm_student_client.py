@@ -76,6 +76,20 @@ class RemoteStudentRollout:
             )
         )
 
+    def fingerprint_weight(self, name: str, *, numel: int = 256) -> dict[str, Any]:
+        return self._checked_response(
+            rpc_call(
+                self.host,
+                self.port,
+                {
+                    "op": "fingerprint_weight",
+                    "name": name,
+                    "numel": int(numel),
+                },
+                self.timeout,
+            )
+        )
+
     def sync_weight_items_ipc(
         self,
         weights: Any,

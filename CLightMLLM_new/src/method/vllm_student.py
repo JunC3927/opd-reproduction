@@ -1,4 +1,5 @@
 import os
+import ast
 import asyncio
 from contextlib import contextmanager
 import functools
@@ -122,6 +123,37 @@ def _infer_model_device(model: torch.nn.Module) -> torch.device:
     if torch.cuda.is_available():
         return torch.device("cuda", torch.cuda.current_device())
     return torch.device("cpu")
+
+
+def _fingerprint_weight_on_worker(model: Any, name: str, numel: int) -> str:
+    named_tensors = dict(model.named_parameters())
+    named_tensors.update(dict(model.named_buffers()))
+    tensor = named_tensors.get(name)
+    if tensor is None:
+        available = sorted(named_tensors)[:20]
+        return repr(
+            {
+                "ok": False,
+                "error": f"Tensor {name!r} was not found in vLLM model.",
+                "available_head": available,
+            }
+        )
+
+    sample = tensor.detach().flatten()[: int(numel)].float().cpu()
+    return repr(
+        {
+            "ok": True,
+            "name": name,
+            "numel": int(sample.numel()),
+            "shape": tuple(int(dim) for dim in tensor.shape),
+            "dtype": str(tensor.dtype),
+            "device": str(tensor.device),
+            "sum": float(sample.sum().item()),
+            "mean": float(sample.mean().item()) if sample.numel() else 0.0,
+            "abs_sum": float(sample.abs().sum().item()),
+            "max_abs": float(sample.abs().max().item()) if sample.numel() else 0.0,
+        }
+    )
 
 
 def _ipc_load_weights_on_worker(model: Any, zmq_handle: str, use_shm: bool) -> str:
@@ -730,3 +762,20 @@ class VLLMStudentRollout:
             "This vLLM version may hide the in-process model runner; use HF rollout "
             "or add a version-specific vLLM weight sync adapter."
         )
+
+    def fingerprint_weight(self, name: str, *, numel: int = 256) -> dict[str, Any]:
+        apply_model, owner_name = self._resolve_apply_model_for_ipc()
+        raw_result = apply_model(functools.partial(_fingerprint_weight_on_worker, name=name, numel=int(numel)))
+        first = raw_result[0] if isinstance(raw_result, list) and raw_result else raw_result
+        if isinstance(first, str):
+            try:
+                parsed = ast.literal_eval(first)
+            except (SyntaxError, ValueError):
+                parsed = {"ok": False, "error": f"Could not parse fingerprint result: {first!r}"}
+        elif isinstance(first, dict):
+            parsed = first
+        else:
+            parsed = {"ok": False, "error": f"Unexpected fingerprint result type: {type(first)}"}
+        parsed["path"] = f"{owner_name}.apply_model_fingerprint"
+        parsed["raw_result"] = raw_result
+        return parsed

@@ -162,7 +162,7 @@ class StudentHandler(socketserver.BaseRequestHandler):
                 threading.Thread(target=server.shutdown, daemon=True).start()
                 return
 
-            if op not in {"generate", "sync_state_dict", "start_weight_sync", "finish_weight_sync"}:
+            if op not in {"generate", "sync_state_dict", "start_weight_sync", "finish_weight_sync", "fingerprint_weight"}:
                 send_message(self.request, {"ok": False, "error": f"Unsupported op: {op!r}"})
                 return
 
@@ -180,6 +180,12 @@ class StudentHandler(socketserver.BaseRequestHandler):
                     print(
                         f"[student request {request_id}] received op=sync_state_dict "
                         f"path={request.get('state_dict_path')}",
+                        flush=True,
+                    )
+                elif op == "fingerprint_weight":
+                    print(
+                        f"[student request {request_id}] received op=fingerprint_weight "
+                        f"name={request.get('name')} numel={request.get('numel')}",
                         flush=True,
                     )
                 else:
@@ -223,6 +229,22 @@ class StudentHandler(socketserver.BaseRequestHandler):
                             "ok": True,
                             "sequences": sequences.detach().cpu(),
                             "weight_version": server.state.weight_version,
+                        },
+                    )
+                    return
+
+                if op == "fingerprint_weight":
+                    fingerprint = server.state.rollout.fingerprint_weight(
+                        str(request["name"]),
+                        numel=int(request.get("numel", 256)),
+                    )
+                    send_message(
+                        self.request,
+                        {
+                            "ok": bool(fingerprint.get("ok")),
+                            "weight_version": server.state.weight_version,
+                            "fingerprint": fingerprint,
+                            "error": fingerprint.get("error"),
                         },
                     )
                     return

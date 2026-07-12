@@ -226,6 +226,7 @@ class OPDLearner(RolloutMixin, BaseLearner):
                 weights: list[tuple[str, torch.Tensor]] | None = None
                 try:
                     weights = self._student_model_weight_items()
+                    source_fingerprint = self._local_sync_fingerprint(weights)
                     weight_stats = describe_weight_items_for_ipc(weights, sync_dtype=sync_dtype)
                     print(
                         "[student-vllm-sync rank=0] weight views ready: "
@@ -235,6 +236,12 @@ class OPDLearner(RolloutMixin, BaseLearner):
                         f"weight_stats={weight_stats}",
                         flush=True,
                     )
+                    if source_fingerprint is not None:
+                        print(
+                            "[student-vllm-sync-verify rank=0] source fingerprint: "
+                            f"step={current_step}, fingerprint={source_fingerprint}",
+                            flush=True,
+                        )
                     response = self.student_rollout.sync_weight_items_ipc(
                         weights,
                         bucket_size_mb=int(self.method_args.rollout_student_server_sync_bucket_size_mb),
@@ -249,6 +256,12 @@ class OPDLearner(RolloutMixin, BaseLearner):
                         f"summary={response.get('summary')}",
                         flush=True,
                     )
+                    if source_fingerprint is not None:
+                        self._verify_remote_sync_fingerprint(
+                            source_fingerprint,
+                            current_step=current_step,
+                            weight_version=response.get("weight_version"),
+                        )
                 finally:
                     if weights is not None:
                         weights.clear()
@@ -274,6 +287,82 @@ class OPDLearner(RolloutMixin, BaseLearner):
             seen.add(normalized)
             weights.append((normalized, param.detach()))
         return weights
+
+    def _local_sync_fingerprint(self, weights: list[tuple[str, torch.Tensor]]) -> dict[str, Any] | None:
+        if not self.method_args.rollout_student_server_verify_sync:
+            return None
+        if not weights:
+            return None
+        verify_name = self.method_args.rollout_student_server_verify_name
+        if verify_name is None:
+            preferred = (
+                "model.language_model.embed_tokens.weight",
+                "lm_head.weight",
+            )
+            names = {name for name, _tensor in weights}
+            verify_name = next((name for name in preferred if name in names), weights[0][0])
+        tensor = next((value for name, value in weights if name == verify_name), None)
+        if tensor is None:
+            available = [name for name, _tensor in weights[:20]]
+            raise RuntimeError(
+                f"method.rollout_student_server_verify_name={verify_name!r} was not found in summoned weights. "
+                f"Available head: {available}"
+            )
+        sample = tensor.detach().flatten()[: int(self.method_args.rollout_student_server_verify_numel)].float().cpu()
+        return {
+            "name": verify_name,
+            "numel": int(sample.numel()),
+            "shape": tuple(int(dim) for dim in tensor.shape),
+            "dtype": str(tensor.dtype),
+            "device": str(tensor.device),
+            "sum": float(sample.sum().item()),
+            "mean": float(sample.mean().item()) if sample.numel() else 0.0,
+            "abs_sum": float(sample.abs().sum().item()),
+            "max_abs": float(sample.abs().max().item()) if sample.numel() else 0.0,
+        }
+
+    def _verify_remote_sync_fingerprint(
+        self,
+        source_fingerprint: dict[str, Any],
+        *,
+        current_step: int,
+        weight_version: Any,
+    ) -> None:
+        if not isinstance(self.student_rollout, RemoteStudentRollout):
+            return
+        response = self.student_rollout.fingerprint_weight(
+            str(source_fingerprint["name"]),
+            numel=int(source_fingerprint["numel"]),
+        )
+        remote_fingerprint = response.get("fingerprint") or {}
+        comparisons = {}
+        for key in ("sum", "mean", "abs_sum", "max_abs"):
+            source_value = float(source_fingerprint.get(key, 0.0))
+            remote_value = float(remote_fingerprint.get(key, 0.0))
+            diff = abs(source_value - remote_value)
+            allowed = (
+                float(self.method_args.rollout_student_server_verify_atol)
+                + float(self.method_args.rollout_student_server_verify_rtol) * abs(source_value)
+            )
+            comparisons[key] = {
+                "source": source_value,
+                "remote": remote_value,
+                "abs_diff": diff,
+                "allowed": allowed,
+                "ok": diff <= allowed,
+            }
+        match = bool(remote_fingerprint.get("ok")) and all(item["ok"] for item in comparisons.values())
+        print(
+            "[student-vllm-sync-verify rank=0] remote fingerprint: "
+            f"step={current_step}, weight_version={weight_version}, match={match}, "
+            f"source_dtype={source_fingerprint.get('dtype')}, "
+            f"remote_dtype={remote_fingerprint.get('dtype')}, "
+            f"source_device={source_fingerprint.get('device')}, "
+            f"remote_device={remote_fingerprint.get('device')}, "
+            f"comparisons={comparisons}, "
+            f"remote={remote_fingerprint}",
+            flush=True,
+        )
 
     def _remote_sync_dtype(self) -> torch.dtype | None:
         value = self.method_args.rollout_student_server_sync_dtype
