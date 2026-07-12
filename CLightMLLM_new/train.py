@@ -178,20 +178,22 @@ class TrainingApp:
         trainer_kwargs = trainer_args.lightning_kwargs()
         trainer_kwargs["strategy"] = self.build_strategy(trainer_args, model=model)
         loggers = self.build_loggers(trainer_args)
+        callbacks = [
+            HFModelExportCallback(
+                processor=processor,
+                output_dir=model_output_dir,
+                enabled=trainer_args.export_hf_model_at_end,
+                merge_lora_before_export=trainer_args.merge_lora_before_export,
+            ),
+            RankZeroWandbFinishCallback(),
+            JSONLMetricsCallback(trainer_args.metrics_jsonl),
+        ]
+        if loggers:
+            callbacks.insert(0, LearningRateMonitor(logging_interval="step"))
         trainer = L.Trainer(
             **trainer_kwargs,
             logger=loggers,
-            callbacks=[
-                LearningRateMonitor(logging_interval="step"),
-                HFModelExportCallback(
-                    processor=processor,
-                    output_dir=model_output_dir,
-                    enabled=trainer_args.export_hf_model_at_end,
-                    merge_lora_before_export=trainer_args.merge_lora_before_export,
-                ),
-                RankZeroWandbFinishCallback(),
-                JSONLMetricsCallback(trainer_args.metrics_jsonl),
-            ],
+            callbacks=callbacks,
         )
         trainer.fit(module, datamodule=datamodule, ckpt_path=trainer_args.resume_from_checkpoint)
 
