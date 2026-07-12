@@ -4,6 +4,7 @@ from typing import Any
 
 import torch
 
+from .vllm_student import send_weight_items_ipc
 from .teacher_rpc import rpc_call
 
 
@@ -58,6 +59,49 @@ class RemoteStudentRollout:
                 self.timeout,
             )
         )
+
+    def sync_weight_items_ipc(
+        self,
+        weights: Any,
+        *,
+        bucket_size_mb: int,
+        device: str | torch.device | None,
+        sync_dtype: torch.dtype | None,
+        zmq_handle: str | None = None,
+    ) -> dict[str, Any]:
+        start_response = self._checked_response(
+            rpc_call(
+                self.host,
+                self.port,
+                {
+                    "op": "start_weight_sync",
+                    "zmq_handle": zmq_handle,
+                },
+                self.timeout,
+            )
+        )
+        sender_summary = send_weight_items_ipc(
+            weights,
+            zmq_handle=start_response["zmq_handle"],
+            bucket_size_mb=bucket_size_mb,
+            use_shm=bool(start_response.get("use_shm", False)),
+            device=device,
+            sync_dtype=sync_dtype,
+        )
+        finish_response = self._checked_response(
+            rpc_call(
+                self.host,
+                self.port,
+                {
+                    "op": "finish_weight_sync",
+                    "session_id": start_response["session_id"],
+                    "sender_summary": sender_summary,
+                },
+                self.timeout,
+            )
+        )
+        finish_response["sender_summary"] = sender_summary
+        return finish_response
 
     def shutdown(self) -> dict[str, Any]:
         return self._checked_response(rpc_call(self.host, self.port, {"op": "shutdown"}, self.timeout))

@@ -16,6 +16,7 @@ import sys
 import threading
 import time
 import traceback
+import uuid
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -120,6 +121,7 @@ class StudentState:
         self.lock = threading.Lock()
         self.request_lock = threading.Lock()
         self.request_count = 0
+        self.active_sync_session: dict[str, Any] | None = None
 
     def next_request_id(self) -> int:
         with self.request_lock:
@@ -160,7 +162,7 @@ class StudentHandler(socketserver.BaseRequestHandler):
                 threading.Thread(target=server.shutdown, daemon=True).start()
                 return
 
-            if op not in {"generate", "sync_state_dict"}:
+            if op not in {"generate", "sync_state_dict", "start_weight_sync", "finish_weight_sync"}:
                 send_message(self.request, {"ok": False, "error": f"Unsupported op: {op!r}"})
                 return
 
@@ -174,10 +176,16 @@ class StudentHandler(socketserver.BaseRequestHandler):
                         f"weight_version={server.state.weight_version}",
                         flush=True,
                     )
-                else:
+                elif op == "sync_state_dict":
                     print(
                         f"[student request {request_id}] received op=sync_state_dict "
                         f"path={request.get('state_dict_path')}",
+                        flush=True,
+                    )
+                else:
+                    print(
+                        f"[student request {request_id}] received op={op} "
+                        f"session_id={request.get('session_id')}",
                         flush=True,
                     )
 
@@ -191,6 +199,8 @@ class StudentHandler(socketserver.BaseRequestHandler):
                     )
 
                 if op == "generate":
+                    if server.state.active_sync_session is not None:
+                        raise RuntimeError("Cannot generate while a remote weight sync session is active.")
                     method_args = SimpleNamespace(**request["method_args"])
                     start = time.time()
                     sequences = server.state.rollout.generate(
@@ -213,6 +223,94 @@ class StudentHandler(socketserver.BaseRequestHandler):
                             "ok": True,
                             "sequences": sequences.detach().cpu(),
                             "weight_version": server.state.weight_version,
+                        },
+                    )
+                    return
+
+                if op == "start_weight_sync":
+                    if server.state.active_sync_session is not None:
+                        raise RuntimeError("A remote weight sync session is already active.")
+                    session_id = uuid.uuid4().hex
+                    zmq_handle = (
+                        request.get("zmq_handle")
+                        or f"ipc:///tmp/clight-student-vllm-remote-{os.getpid()}-{session_id}.sock"
+                    )
+                    start = time.time()
+                    session = server.state.rollout.start_weight_sync_receiver(
+                        zmq_handle=zmq_handle,
+                        use_shm=server.state.use_shm,
+                    )
+                    session["session_id"] = session_id
+                    session["request_id"] = request_id
+                    server.state.active_sync_session = session
+                    time.sleep(0.5)
+                    if session["result_box"].get("ok") is False:
+                        server.state.active_sync_session = None
+                        raise RuntimeError(
+                            "Student vLLM remote IPC receiver failed before sender started: "
+                            f"{session['result_box'].get('error')}"
+                        )
+                    print(
+                        f"[student request {request_id}] remote_sync_receiver_ready "
+                        f"session_id={session_id} zmq_handle={zmq_handle} "
+                        f"use_shm={server.state.use_shm} seconds={time.time() - start:.3f}",
+                        flush=True,
+                    )
+                    send_message(
+                        self.request,
+                        {
+                            "ok": True,
+                            "session_id": session_id,
+                            "zmq_handle": zmq_handle,
+                            "use_shm": server.state.use_shm,
+                            "weight_version": server.state.weight_version,
+                        },
+                    )
+                    return
+
+                if op == "finish_weight_sync":
+                    session = server.state.active_sync_session
+                    if session is None:
+                        raise RuntimeError("No remote weight sync session is active.")
+                    if request.get("session_id") != session.get("session_id"):
+                        raise RuntimeError(
+                            f"Remote weight sync session mismatch: got {request.get('session_id')!r}, "
+                            f"expected {session.get('session_id')!r}."
+                        )
+                    start = time.time()
+                    thread = session["thread"]
+                    thread.join(timeout=server.state.ipc_timeout_sec)
+                    if thread.is_alive():
+                        raise TimeoutError(
+                            f"Student vLLM remote IPC receiver timed out after {server.state.ipc_timeout_sec}s."
+                        )
+                    result_box = session["result_box"]
+                    if not result_box.get("ok"):
+                        server.state.active_sync_session = None
+                        raise RuntimeError(f"Student vLLM remote IPC receiver failed: {result_box.get('error')}")
+                    server.state.active_sync_session = None
+                    server.state.weight_version += 1
+                    summary = {
+                        "path": f"{session['owner_name']}.apply_model_remote_ipc",
+                        "receiver_result": result_box.get("result"),
+                        "receiver_wait_sec": time.time() - session["started_at"],
+                        "finish_sec": time.time() - start,
+                        "sender_summary": request.get("sender_summary"),
+                    }
+                    gc.collect()
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                    print(
+                        f"[student request {request_id}] remote_sync_done "
+                        f"weight_version={server.state.weight_version} summary={summary}",
+                        flush=True,
+                    )
+                    send_message(
+                        self.request,
+                        {
+                            "ok": True,
+                            "weight_version": server.state.weight_version,
+                            "summary": summary,
                         },
                     )
                     return

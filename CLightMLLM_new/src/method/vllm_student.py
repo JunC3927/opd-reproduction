@@ -162,7 +162,7 @@ def _ipc_load_weights_on_worker(model: Any, zmq_handle: str, use_shm: bool) -> s
 
 
 def _send_weights_via_ipc(
-    weights: list[tuple[str, torch.Tensor]],
+    weights: Any,
     *,
     zmq_handle: str,
     bucket_size_mb: int,
@@ -176,6 +176,84 @@ def _send_weights_via_ipc(
         use_shm=use_shm,
     )
     asyncio.run(sender.async_send_weights(iter(weights)))
+
+
+def _iter_prepared_weight_items_for_ipc(
+    weights: Any,
+    *,
+    device: torch.device | str | None,
+    use_shm: bool,
+    sync_dtype: torch.dtype | None,
+):
+    target_device = torch.device(device) if device is not None else None
+    for name, tensor in weights:
+        if not torch.is_tensor(tensor):
+            continue
+        value = tensor.detach()
+        if sync_dtype is not None and value.is_floating_point():
+            value = value.to(dtype=sync_dtype)
+        if use_shm:
+            value = value.cpu()
+        elif target_device is not None:
+            value = value.to(device=target_device, non_blocking=True)
+        elif not value.is_cuda:
+            value = value.cuda()
+        yield name, value.contiguous()
+
+
+def send_weight_items_ipc(
+    weights: Any,
+    *,
+    zmq_handle: str,
+    bucket_size_mb: int = 512,
+    use_shm: bool = False,
+    device: torch.device | str | None = None,
+    sync_dtype: torch.dtype | None = None,
+) -> dict[str, Any]:
+    """Send weight tensors to a waiting vLLM receiver over VERL bucketed IPC.
+
+    The weights are moved/cast lazily so the sender does not materialize the
+    full bf16 model on one GPU before transfer.
+    """
+    previous_device = None
+    target_device = torch.device(device) if device is not None else None
+    if not use_shm and target_device is not None and target_device.type == "cuda" and torch.cuda.is_available():
+        previous_device = torch.cuda.current_device()
+        if target_device.index is not None:
+            torch.cuda.set_device(target_device.index)
+
+    counter = {"count": 0}
+
+    def prepared_iter():
+        for item in _iter_prepared_weight_items_for_ipc(
+            weights,
+            device=target_device,
+            use_shm=use_shm,
+            sync_dtype=sync_dtype,
+        ):
+            counter["count"] += 1
+            yield item
+
+    try:
+        start = time.time()
+        _send_weights_via_ipc(
+            prepared_iter(),
+            zmq_handle=zmq_handle,
+            bucket_size_mb=bucket_size_mb,
+            use_shm=use_shm,
+        )
+        sender_sec = time.time() - start
+    finally:
+        if previous_device is not None:
+            torch.cuda.set_device(previous_device)
+
+    return {
+        "weight_count": counter["count"],
+        "sender_sec": sender_sec,
+        "bucket_size_mb": int(bucket_size_mb),
+        "use_shm": bool(use_shm),
+        "zmq_handle": zmq_handle,
+    }
 
 
 class VLLMStudentRollout:
@@ -433,6 +511,51 @@ class VLLMStudentRollout:
         if os.getenv("CLIGHT_OPD_VLLM_DEBUG") == "1" and is_rank_zero_process():
             print(f"OPD student vLLM synced {len(weights)} tensors from HF student.")
 
+    def _resolve_apply_model_for_ipc(self) -> tuple[Any, str]:
+        apply_model = getattr(self.llm, "apply_model", None)
+        owner_name = "llm"
+        if not callable(apply_model):
+            engine = getattr(self.llm, "llm_engine", None)
+            apply_model = getattr(engine, "apply_model", None)
+            owner_name = "llm.llm_engine"
+        if not callable(apply_model):
+            raise RuntimeError("Could not find llm.apply_model or llm.llm_engine.apply_model for IPC sync.")
+        return apply_model, owner_name
+
+    def start_weight_sync_receiver(
+        self,
+        *,
+        zmq_handle: str,
+        use_shm: bool = False,
+    ) -> dict[str, Any]:
+        apply_model, owner_name = self._resolve_apply_model_for_ipc()
+        result_box: dict[str, Any] = {}
+
+        def receiver_target() -> None:
+            try:
+                result_box["result"] = apply_model(
+                    functools.partial(_ipc_load_weights_on_worker, zmq_handle=zmq_handle, use_shm=use_shm)
+                )
+                result_box["ok"] = True
+            except Exception as exc:
+                result_box["ok"] = False
+                result_box["error"] = f"{type(exc).__name__}: {exc}"
+
+        receiver_thread = threading.Thread(
+            target=receiver_target,
+            name="clight-student-vllm-remote-ipc-receiver",
+            daemon=True,
+        )
+        receiver_thread.start()
+        return {
+            "thread": receiver_thread,
+            "result_box": result_box,
+            "owner_name": owner_name,
+            "zmq_handle": zmq_handle,
+            "use_shm": bool(use_shm),
+            "started_at": time.time(),
+        }
+
     def sync_from_weight_items_ipc(
         self,
         weights: list[tuple[str, torch.Tensor]],
@@ -458,33 +581,9 @@ class VLLMStudentRollout:
             if ipc_device.index is not None:
                 torch.cuda.set_device(ipc_device.index)
 
-        apply_model = getattr(self.llm, "apply_model", None)
-        owner_name = "llm"
-        owner = self.llm
-        if not callable(apply_model):
-            engine = getattr(self.llm, "llm_engine", None)
-            apply_model = getattr(engine, "apply_model", None)
-            owner_name = "llm.llm_engine"
-            owner = engine
-        if not callable(apply_model):
-            raise RuntimeError("Could not find llm.apply_model or llm.llm_engine.apply_model for IPC sync.")
+        apply_model, owner_name = self._resolve_apply_model_for_ipc()
 
         try:
-            prepared_weights = []
-            for name, tensor in weights:
-                if not torch.is_tensor(tensor):
-                    continue
-                value = tensor.detach()
-                if sync_dtype is not None and value.is_floating_point():
-                    value = value.to(dtype=sync_dtype)
-                if use_shm:
-                    value = value.cpu()
-                elif ipc_device is not None:
-                    value = value.to(device=ipc_device, non_blocking=True)
-                elif not value.is_cuda:
-                    value = value.cuda()
-                prepared_weights.append((name, value.contiguous()))
-
             zmq_handle = f"ipc:///tmp/clight-student-vllm-ipc-{os.getpid()}-{uuid.uuid4().hex}.sock"
             result_box: dict[str, Any] = {}
 
@@ -510,11 +609,13 @@ class VLLMStudentRollout:
                 raise RuntimeError(f"Student vLLM IPC receiver failed before send: {result_box.get('error')}")
 
             sender_start = time.time()
-            _send_weights_via_ipc(
-                prepared_weights,
+            sender_summary = send_weight_items_ipc(
+                weights,
                 zmq_handle=zmq_handle,
                 bucket_size_mb=bucket_size_mb,
                 use_shm=use_shm,
+                device=ipc_device,
+                sync_dtype=sync_dtype,
             )
             sender_sec = time.time() - sender_start
 
@@ -531,7 +632,7 @@ class VLLMStudentRollout:
         if os.getenv("CLIGHT_OPD_VLLM_DEBUG") == "1" and is_rank_zero_process():
             print(
                 "OPD student vLLM IPC synced:",
-                f"weights={len(prepared_weights)}",
+                f"weights={sender_summary['weight_count']}",
                 f"bucket_size_mb={bucket_size_mb}",
                 f"use_shm={use_shm}",
                 f"sender_sec={sender_sec:.3f}",
@@ -540,7 +641,7 @@ class VLLMStudentRollout:
             )
 
         return {
-            "weight_count": len(prepared_weights),
+            "weight_count": sender_summary["weight_count"],
             "sender_sec": sender_sec,
             "total_sec": total_sec,
             "path": f"{owner_name}.apply_model_ipc",

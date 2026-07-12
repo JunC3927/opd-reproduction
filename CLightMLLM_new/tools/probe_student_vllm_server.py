@@ -33,7 +33,9 @@ from probe_student_vllm_rollout_sync import (  # noqa: E402
     parse_yaml_args,
     resolve_device,
     resolve_path,
+    weight_items_from_model,
 )
+from src.hparams import parse_torch_dtype  # noqa: E402
 from src.method.vllm_student_client import RemoteStudentRollout  # noqa: E402
 from src.model import ModelTuner, load_vision_language_model  # noqa: E402
 
@@ -62,6 +64,15 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Optional exported student state dict. If set, the server syncs it before the second generate.",
     )
+    parser.add_argument(
+        "--sync-mode",
+        choices=("state_dict", "client_ipc", "none"),
+        default="state_dict",
+        help="state_dict asks the server to load --state-dict-path; client_ipc sends client memory tensors directly.",
+    )
+    parser.add_argument("--sync-device", default="cuda:0", help="Sender CUDA device for --sync-mode client_ipc.")
+    parser.add_argument("--sync-dtype", default="bfloat16", help="Sender dtype for floating tensors; use 'none' to keep dtype.")
+    parser.add_argument("--ipc-bucket-size-mb", type=int, default=512)
     parser.add_argument("--skip-before-generate", action="store_true")
     parser.add_argument("--shutdown-server", action="store_true")
     parser.add_argument(
@@ -188,14 +199,32 @@ def main() -> None:
             label="server generate before sync",
         )
 
-    if args.state_dict_path:
+    if args.sync_mode == "state_dict" and args.state_dict_path:
         state_path = resolve_path(args.state_dict_path)
         log(f"server weight sync start: state_dict_path={state_path}")
         start = time.time()
         sync_response = client.sync_state_dict(state_path)
         log(f"server weight sync done: seconds={time.time() - start:.3f}, response={sync_response}")
+    elif args.sync_mode == "client_ipc":
+        sync_dtype = None if args.sync_dtype.lower() == "none" else parse_torch_dtype(args.sync_dtype)
+        weights = weight_items_from_model(model)
+        log(
+            "server remote IPC weight sync start: "
+            f"tensors={len(weights)}, sync_device={args.sync_device}, "
+            f"sync_dtype={sync_dtype}, bucket_size_mb={args.ipc_bucket_size_mb}"
+        )
+        start = time.time()
+        sync_response = client.sync_weight_items_ipc(
+            weights,
+            bucket_size_mb=args.ipc_bucket_size_mb,
+            device=args.sync_device,
+            sync_dtype=sync_dtype,
+        )
+        log(f"server remote IPC weight sync done: seconds={time.time() - start:.3f}, response={sync_response}")
+    elif args.sync_mode == "state_dict":
+        log("server weight sync skipped: --sync-mode state_dict needs --state-dict-path")
     else:
-        log("server weight sync skipped: no --state-dict-path")
+        log("server weight sync skipped")
 
     server_generate(
         client=client,
