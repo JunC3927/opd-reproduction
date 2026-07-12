@@ -54,6 +54,7 @@ method:
     rollout_temperature: 1.0
     rollout_top_p: 1.0
     rollout_top_k: null
+    rollout_use_cache: true
     rollout_max_new_tokens: 512
 
 tuning:

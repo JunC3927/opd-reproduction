@@ -69,6 +69,7 @@ class MethodArguments:
     rollout_temperature: float = 0.7
     rollout_top_p: float = 0.9
     rollout_top_k: int | None = None
+    rollout_use_cache: bool = True
     rollout_vllm_device: str | None = None
     rollout_vllm_visible_devices: str | None = None
     rollout_vllm_tensor_parallel_size: int = 1
