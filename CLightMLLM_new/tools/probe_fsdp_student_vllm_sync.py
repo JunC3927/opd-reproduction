@@ -19,6 +19,7 @@ student vLLM rollout into OPD:
 from __future__ import annotations
 
 import argparse
+import contextlib
 import gc
 import os
 import sys
@@ -129,11 +130,12 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--sync-mode",
-        choices=("local_vllm", "remote_ipc", "export_only"),
+        choices=("local_vllm", "remote_ipc", "remote_ipc_summon", "export_only"),
         default="local_vllm",
         help=(
             "local_vllm preserves the original in-process vLLM smoke path; "
             "remote_ipc sends rank0 full-state weights to a standalone student vLLM server; "
+            "remote_ipc_summon sends rank0 summoned FSDP parameter views without building a CPU full-state dict; "
             "export_only only gathers/saves the full state."
         ),
     )
@@ -157,6 +159,18 @@ def parse_args() -> argparse.Namespace:
         "--remote-sync-device",
         default=None,
         help="Sender device for remote IPC. Leave unset to use current rank0 CUDA device or SHM CPU path.",
+    )
+    parser.add_argument(
+        "--summon-rank0-only",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Use FSDP.summon_full_params(rank0_only=...) for remote_ipc_summon.",
+    )
+    parser.add_argument(
+        "--summon-offload-to-cpu",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Use FSDP.summon_full_params(offload_to_cpu=...) for remote_ipc_summon.",
     )
     parser.add_argument(
         "--sync-dtype",
@@ -329,6 +343,13 @@ def state_dict_to_weight_items(state_dict: dict[str, torch.Tensor]) -> list[tupl
     return [(name, tensor.detach()) for name, tensor in state_dict.items() if torch.is_tensor(tensor)]
 
 
+def normalize_summoned_param_name(name: str) -> str:
+    for prefix in ("_fsdp_wrapped_module.", "module."):
+        while name.startswith(prefix):
+            name = name[len(prefix) :]
+    return name
+
+
 def save_exported_state_dict(
     state_dict: dict[str, torch.Tensor],
     *,
@@ -390,11 +411,35 @@ def sync_remote_student_from_state_dict(
     sync_device: str | None,
     sync_dtype: torch.dtype | None,
 ) -> dict[str, Any]:
-    weights = state_dict_to_weight_items(state_dict)
+    return sync_remote_student_from_weight_items(
+        state_dict_to_weight_items(state_dict),
+        host=host,
+        port=port,
+        timeout_sec=timeout_sec,
+        bucket_size_mb=bucket_size_mb,
+        use_shm=use_shm,
+        sync_device=sync_device,
+        sync_dtype=sync_dtype,
+        source_label="full_state_dict",
+    )
+
+
+def sync_remote_student_from_weight_items(
+    weights: list[tuple[str, torch.Tensor]],
+    *,
+    host: str,
+    port: int,
+    timeout_sec: float,
+    bucket_size_mb: int,
+    use_shm: bool,
+    sync_device: str | None,
+    sync_dtype: torch.dtype | None,
+    source_label: str,
+) -> dict[str, Any]:
     weight_stats = describe_weight_items_for_ipc(weights, sync_dtype=sync_dtype)
     log(
         "remote student IPC sync start: "
-        f"server={host}:{port}, tensors={len(weights)}, sync_device={sync_device}, "
+        f"source={source_label}, server={host}:{port}, tensors={len(weights)}, sync_device={sync_device}, "
         f"sync_dtype={sync_dtype}, bucket_size_mb={bucket_size_mb}, use_shm={use_shm}, "
         f"weight_stats={weight_stats}"
     )
@@ -423,6 +468,89 @@ def sync_remote_student_from_state_dict(
         raise
     response["client_total_sec"] = time.time() - start
     log(f"remote student IPC sync done: seconds={response['client_total_sec']:.3f}, response={response}")
+    return response
+
+
+@contextlib.contextmanager
+def summon_full_params_compat(
+    fsdp_model: FSDP,
+    *,
+    rank0_only: bool,
+    offload_to_cpu: bool,
+):
+    kwargs = {
+        "writeback": False,
+        "recurse": True,
+        "rank0_only": rank0_only,
+        "offload_to_cpu": offload_to_cpu,
+    }
+    try:
+        ctx = FSDP.summon_full_params(fsdp_model, **kwargs)
+    except TypeError:
+        log(
+            "FSDP.summon_full_params does not accept rank0_only/offload_to_cpu in this torch build; "
+            "falling back to writeback=False,recurse=True",
+            all_ranks=True,
+        )
+        ctx = FSDP.summon_full_params(fsdp_model, writeback=False, recurse=True)
+    with ctx:
+        yield
+
+
+def sync_remote_student_from_summoned_fsdp(
+    fsdp_model: FSDP,
+    *,
+    host: str,
+    port: int,
+    timeout_sec: float,
+    bucket_size_mb: int,
+    use_shm: bool,
+    sync_device: str | None,
+    sync_dtype: torch.dtype | None,
+    rank0_only: bool,
+    offload_to_cpu: bool,
+    local_rank: int,
+) -> dict[str, Any] | None:
+    log(
+        "FSDP summon_full_params start: "
+        f"rank0_only={rank0_only}, offload_to_cpu={offload_to_cpu}",
+        all_ranks=True,
+    )
+    start = time.time()
+    response = None
+    with summon_full_params_compat(fsdp_model, rank0_only=rank0_only, offload_to_cpu=offload_to_cpu):
+        log(f"FSDP summon_full_params entered: seconds={time.time() - start:.3f}", all_ranks=True)
+        if is_rank0():
+            weights: list[tuple[str, torch.Tensor]] = []
+            seen: set[str] = set()
+            for name, param in fsdp_model.named_parameters():
+                if not torch.is_tensor(param):
+                    continue
+                normalized = normalize_summoned_param_name(name)
+                if normalized in seen:
+                    continue
+                seen.add(normalized)
+                weights.append((normalized, param.detach()))
+
+            devices = sorted({str(tensor.device) for _, tensor in weights})
+            dtypes = sorted({str(tensor.dtype) for _, tensor in weights})
+            total_numel = sum(tensor.numel() for _, tensor in weights)
+            log(
+                "FSDP summoned parameter views ready: "
+                f"tensors={len(weights)}, total_numel={total_numel:,}, devices={devices}, dtypes={dtypes}"
+            )
+            response = sync_remote_student_from_weight_items(
+                weights,
+                host=host,
+                port=port,
+                timeout_sec=timeout_sec,
+                bucket_size_mb=bucket_size_mb,
+                use_shm=use_shm,
+                sync_device=sync_device,
+                sync_dtype=sync_dtype,
+                source_label="summon_full_params",
+            )
+        distributed_barrier("inside-summon-remote-sync", local_rank=local_rank)
     return response
 
 
@@ -512,6 +640,26 @@ def main() -> None:
         sync_cuda(device, "FSDP wrap done")
 
         distributed_barrier("post-FSDP-wrap", local_rank=local_rank)
+        if args.sync_mode == "remote_ipc_summon":
+            sync_dtype = None if args.sync_dtype.lower() == "none" else parse_torch_dtype(args.sync_dtype)
+            sync_remote_student_from_summoned_fsdp(
+                fsdp_model,
+                host=args.remote_student_host,
+                port=args.remote_student_port,
+                timeout_sec=args.ipc_timeout_sec,
+                bucket_size_mb=args.ipc_bucket_size_mb,
+                use_shm=args.ipc_use_shm,
+                sync_device=args.remote_sync_device,
+                sync_dtype=sync_dtype,
+                rank0_only=args.summon_rank0_only,
+                offload_to_cpu=args.summon_offload_to_cpu,
+                local_rank=local_rank,
+            )
+            if is_rank0():
+                log("RESULT=OK")
+            distributed_barrier("post-remote-ipc-summon-sync", local_rank=local_rank)
+            return
+
         state_dict = collect_full_state_dict(fsdp_model, offload_to_cpu=args.full_state_offload_to_cpu)
         if args.skip_save_state:
             log("skip_save_state requested; not writing FSDP full_state_dict to disk")
