@@ -231,6 +231,8 @@ class StudentHandler(socketserver.BaseRequestHandler):
                     if server.state.active_sync_session is not None:
                         raise RuntimeError("A remote weight sync session is already active.")
                     session_id = uuid.uuid4().hex
+                    requested_use_shm = request.get("use_shm")
+                    use_shm = server.state.use_shm if requested_use_shm is None else bool(requested_use_shm)
                     zmq_handle = (
                         request.get("zmq_handle")
                         or f"ipc:///tmp/clight-student-vllm-remote-{os.getpid()}-{session_id}.sock"
@@ -238,10 +240,11 @@ class StudentHandler(socketserver.BaseRequestHandler):
                     start = time.time()
                     session = server.state.rollout.start_weight_sync_receiver(
                         zmq_handle=zmq_handle,
-                        use_shm=server.state.use_shm,
+                        use_shm=use_shm,
                     )
                     session["session_id"] = session_id
                     session["request_id"] = request_id
+                    session["requested_use_shm"] = requested_use_shm
                     server.state.active_sync_session = session
                     time.sleep(0.5)
                     if session["result_box"].get("ok") is False:
@@ -253,7 +256,8 @@ class StudentHandler(socketserver.BaseRequestHandler):
                     print(
                         f"[student request {request_id}] remote_sync_receiver_ready "
                         f"session_id={session_id} zmq_handle={zmq_handle} "
-                        f"use_shm={server.state.use_shm} seconds={time.time() - start:.3f}",
+                        f"use_shm={use_shm} requested_use_shm={requested_use_shm} "
+                        f"seconds={time.time() - start:.3f}",
                         flush=True,
                     )
                     send_message(
@@ -262,7 +266,8 @@ class StudentHandler(socketserver.BaseRequestHandler):
                             "ok": True,
                             "session_id": session_id,
                             "zmq_handle": zmq_handle,
-                            "use_shm": server.state.use_shm,
+                            "use_shm": use_shm,
+                            "server_default_use_shm": server.state.use_shm,
                             "weight_version": server.state.weight_version,
                         },
                     )

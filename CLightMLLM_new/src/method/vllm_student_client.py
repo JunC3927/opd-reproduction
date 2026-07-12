@@ -65,6 +65,7 @@ class RemoteStudentRollout:
         weights: Any,
         *,
         bucket_size_mb: int,
+        use_shm: bool | None = None,
         device: str | torch.device | None,
         sync_dtype: torch.dtype | None,
         zmq_handle: str | None = None,
@@ -76,18 +77,22 @@ class RemoteStudentRollout:
                 {
                     "op": "start_weight_sync",
                     "zmq_handle": zmq_handle,
+                    "use_shm": use_shm,
                 },
                 self.timeout,
             )
         )
+        resolved_use_shm = bool(start_response.get("use_shm", False))
         sender_summary = send_weight_items_ipc(
             weights,
             zmq_handle=start_response["zmq_handle"],
             bucket_size_mb=bucket_size_mb,
-            use_shm=bool(start_response.get("use_shm", False)),
+            use_shm=resolved_use_shm,
             device=device,
             sync_dtype=sync_dtype,
         )
+        sender_summary["requested_use_shm"] = use_shm
+        sender_summary["resolved_use_shm"] = resolved_use_shm
         finish_response = self._checked_response(
             rpc_call(
                 self.host,

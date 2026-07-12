@@ -384,6 +384,7 @@ def sync_remote_student_from_state_dict(
     port: int,
     timeout_sec: float,
     bucket_size_mb: int,
+    use_shm: bool,
     sync_device: str | None,
     sync_dtype: torch.dtype | None,
 ) -> dict[str, Any]:
@@ -391,7 +392,7 @@ def sync_remote_student_from_state_dict(
     log(
         "remote student IPC sync start: "
         f"server={host}:{port}, tensors={len(weights)}, sync_device={sync_device}, "
-        f"sync_dtype={sync_dtype}, bucket_size_mb={bucket_size_mb}"
+        f"sync_dtype={sync_dtype}, bucket_size_mb={bucket_size_mb}, use_shm={use_shm}"
     )
     client = RemoteStudentRollout(host=host, port=port, timeout=timeout_sec)
     ping = client.ping()
@@ -400,6 +401,7 @@ def sync_remote_student_from_state_dict(
     response = client.sync_weight_items_ipc(
         weights,
         bucket_size_mb=bucket_size_mb,
+        use_shm=use_shm,
         device=sync_device,
         sync_dtype=sync_dtype,
     )
@@ -517,6 +519,7 @@ def main() -> None:
                     port=args.remote_student_port,
                     timeout_sec=args.ipc_timeout_sec,
                     bucket_size_mb=args.ipc_bucket_size_mb,
+                    use_shm=args.ipc_use_shm,
                     sync_device=args.remote_sync_device,
                     sync_dtype=sync_dtype,
                 )
