@@ -8,10 +8,10 @@ student vLLM rollout into OPD:
 1. initialize an NCCL training process group;
 2. load and FSDP-wrap the HF student on all training ranks;
 3. gather a full FSDP state dict with all ranks participating;
-4. destroy the training process group;
-5. start one student vLLM engine on rank 0, preferably on a GPU outside the
-   training ranks;
-6. send rank-0 weights to vLLM with the bucketed IPC path.
+4. optionally save the full state dict and stop, so vLLM can be launched from a
+   separate non-torchrun process;
+5. otherwise destroy the training process group and try in-process rank-0 vLLM
+   sync. Prefer the two-step export+sync path when debugging c10d issues.
 """
 
 from __future__ import annotations
@@ -105,6 +105,16 @@ def parse_args() -> argparse.Namespace:
         "--keep-gradient-checkpointing",
         action="store_true",
         help="Keep YAML gradient checkpointing. Default disables it because this probe does not train.",
+    )
+    parser.add_argument(
+        "--export-state-path",
+        default="experiments/probes/fsdp_student_full_state.pt",
+        help="Path where rank 0 saves the gathered full state dict.",
+    )
+    parser.add_argument(
+        "--stop-after-export",
+        action="store_true",
+        help="Stop after saving the FSDP full state dict. Use the single-process sync script next.",
     )
     parser.add_argument("--skip-vllm", action="store_true", help="Only test FSDP full-state export.")
     parser.add_argument("--vllm-device", default="cuda:4", help="Rank-0 vLLM device, e.g. cuda:4.")
@@ -286,6 +296,36 @@ def state_dict_to_weight_items(state_dict: dict[str, torch.Tensor]) -> list[tupl
     return [(name, tensor.detach()) for name, tensor in state_dict.items() if torch.is_tensor(tensor)]
 
 
+def save_exported_state_dict(
+    state_dict: dict[str, torch.Tensor],
+    *,
+    path: str,
+    config_path: str,
+    model_path: str | None,
+    ws: int,
+) -> None:
+    if not is_rank0():
+        return
+    output_path = Path(path)
+    if not output_path.is_absolute():
+        output_path = ROOT / output_path
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    log(f"saving FSDP full_state_dict: path={output_path}")
+    start = time.time()
+    torch.save(
+        {
+            "format": "clight_fsdp_full_state_probe_v1",
+            "config_path": str(config_path),
+            "model_path": str(model_path),
+            "world_size": int(ws),
+            "state_dict": state_dict,
+        },
+        output_path,
+    )
+    size_gib = output_path.stat().st_size / 1024**3
+    log(f"saved FSDP full_state_dict: seconds={time.time() - start:.3f}, size={size_gib:.2f}GiB")
+
+
 def collect_full_state_dict(fsdp_model: FSDP) -> dict[str, torch.Tensor]:
     state_cfg = FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
     log("FSDP full_state_dict start", all_ranks=True)
@@ -392,7 +432,21 @@ def main() -> None:
 
         distributed_barrier("post-FSDP-wrap", local_rank=local_rank)
         state_dict = collect_full_state_dict(fsdp_model)
+        save_exported_state_dict(
+            state_dict,
+            path=args.export_state_path,
+            config_path=config_path,
+            model_path=model_args.model_name_or_path,
+            ws=ws,
+        )
+        distributed_barrier("post-state-save", local_rank=local_rank)
         distributed_barrier("post-full-state", local_rank=local_rank)
+
+        if args.stop_after_export:
+            log("stop_after_export requested; skipping vLLM in torchrun process", all_ranks=True)
+            if is_rank0():
+                log("RESULT=OK")
+            return
 
         log("destroying training process group before vLLM init", all_ranks=True)
         destroy_distributed()
