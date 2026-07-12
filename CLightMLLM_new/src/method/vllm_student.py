@@ -125,16 +125,71 @@ def _infer_model_device(model: torch.nn.Module) -> torch.device:
     return torch.device("cpu")
 
 
+def _candidate_vllm_weight_names(name: str) -> list[str]:
+    candidates = [name]
+    if name.startswith("model."):
+        candidates.append(name[len("model.") :])
+    if name.startswith("model.language_model."):
+        tail = name[len("model.language_model.") :]
+        candidates.extend(
+            [
+                f"language_model.{tail}",
+                f"model.{tail}",
+                tail,
+            ]
+        )
+    if name.startswith("language_model."):
+        candidates.append(name[len("language_model.") :])
+
+    result = []
+    seen = set()
+    for candidate in candidates:
+        if candidate and candidate not in seen:
+            seen.add(candidate)
+            result.append(candidate)
+    return result
+
+
+def _resolve_vllm_weight_tensor(named_tensors: dict[str, torch.Tensor], name: str) -> tuple[str | None, torch.Tensor | None, dict[str, Any]]:
+    for candidate in _candidate_vllm_weight_names(name):
+        tensor = named_tensors.get(candidate)
+        if tensor is not None:
+            return candidate, tensor, {"match_type": "exact_or_alias", "candidates": _candidate_vllm_weight_names(name)}
+
+    parts = [part for part in name.split(".") if part]
+    suffixes = []
+    for suffix_len in range(min(6, len(parts)), 1, -1):
+        suffixes.append(".".join(parts[-suffix_len:]))
+    suffixes.append(parts[-1] if parts else name)
+
+    for suffix in suffixes:
+        matches = [key for key in named_tensors if key == suffix or key.endswith(f".{suffix}")]
+        if len(matches) == 1:
+            resolved = matches[0]
+            return resolved, named_tensors[resolved], {"match_type": "unique_suffix", "suffix": suffix}
+        if len(matches) > 1:
+            return None, None, {
+                "match_type": "ambiguous_suffix",
+                "suffix": suffix,
+                "matches": sorted(matches)[:20],
+                "match_count": len(matches),
+            }
+
+    return None, None, {"match_type": "not_found"}
+
+
 def _fingerprint_weight_on_worker(model: Any, name: str, numel: int) -> str:
     named_tensors = dict(model.named_parameters())
     named_tensors.update(dict(model.named_buffers()))
-    tensor = named_tensors.get(name)
+    resolved_name, tensor, resolution = _resolve_vllm_weight_tensor(named_tensors, name)
     if tensor is None:
         available = sorted(named_tensors)[:20]
         return repr(
             {
                 "ok": False,
                 "error": f"Tensor {name!r} was not found in vLLM model.",
+                "requested_name": name,
+                "resolution": resolution,
                 "available_head": available,
             }
         )
@@ -143,7 +198,10 @@ def _fingerprint_weight_on_worker(model: Any, name: str, numel: int) -> str:
     return repr(
         {
             "ok": True,
-            "name": name,
+            "name": resolved_name,
+            "requested_name": name,
+            "resolved_name": resolved_name,
+            "resolution": resolution,
             "numel": int(sample.numel()),
             "shape": tuple(int(dim) for dim in tensor.shape),
             "dtype": str(tensor.dtype),
