@@ -341,8 +341,16 @@ class RolloutMixin:
         if FSDP is None:
             return contextlib.nullcontext()
 
-        candidates = [self.model]
         trainer = getattr(self, "trainer", None)
+        strategy = getattr(trainer, "strategy", None)
+        if strategy is not None and "FSDP" in type(strategy).__name__:
+            # In Lightning FSDP, training_step runs inside the wrapper forward.
+            # Calling summon_full_params there raises "Cannot manually unshard
+            # parameters during forward/backward"; regular FSDP forwards during
+            # generate can unshard their own shards on demand.
+            return contextlib.nullcontext()
+
+        candidates = [self.model]
         if trainer is not None:
             candidates.extend(
                 candidate
