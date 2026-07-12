@@ -25,10 +25,12 @@ from src.hparams import (
     OptimizerArguments,
     TrainerArguments,
     TuningArguments,
+    parse_torch_dtype,
 )
 from src.method import create_learner
 from src.model import (
     HFModelExportCallback,
+    JSONLMetricsCallback,
     ModelTuner,
     RankZeroWandbFinishCallback,
     SwanLabLogger,
@@ -188,6 +190,7 @@ class TrainingApp:
                     merge_lora_before_export=trainer_args.merge_lora_before_export,
                 ),
                 RankZeroWandbFinishCallback(),
+                JSONLMetricsCallback(trainer_args.metrics_jsonl),
             ],
         )
         trainer.fit(module, datamodule=datamodule, ckpt_path=trainer_args.resume_from_checkpoint)
@@ -271,9 +274,15 @@ class TrainingApp:
             min_num_params=trainer_args.fsdp_min_num_params,
         )
         mixed_precision = MixedPrecision(
-            param_dtype=torch.bfloat16,
-            reduce_dtype=torch.float32,
-            buffer_dtype=torch.float32,
+            param_dtype=(
+                None if trainer_args.fsdp_param_dtype is None else parse_torch_dtype(trainer_args.fsdp_param_dtype)
+            ),
+            reduce_dtype=(
+                None if trainer_args.fsdp_reduce_dtype is None else parse_torch_dtype(trainer_args.fsdp_reduce_dtype)
+            ),
+            buffer_dtype=(
+                None if trainer_args.fsdp_buffer_dtype is None else parse_torch_dtype(trainer_args.fsdp_buffer_dtype)
+            ),
         )
         kwargs = {
             "auto_wrap_policy": auto_wrap_policy,

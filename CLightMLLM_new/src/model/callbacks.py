@@ -1,4 +1,5 @@
 import logging
+import json
 import os
 from typing import Any
 
@@ -81,3 +82,63 @@ class RankZeroWandbFinishCallback(Callback):
                     wandb.finish()
         finally:
             trainer.strategy.barrier()
+
+
+class JSONLMetricsCallback(Callback):
+    def __init__(self, output_path: str | None) -> None:
+        self.output_path = output_path
+        self._handle = None
+
+    @staticmethod
+    def to_jsonable(value: Any) -> Any:
+        if torch.is_tensor(value):
+            value = value.detach()
+            if value.numel() == 1:
+                return value.float().cpu().item()
+            return value.float().cpu().tolist()
+        if isinstance(value, (int, float, str, bool)) or value is None:
+            return value
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return str(value)
+
+    def on_train_start(self, trainer: L.Trainer, pl_module: L.LightningModule) -> None:
+        if not self.output_path or not trainer.is_global_zero:
+            return
+        path = self.output_path
+        if not os.path.isabs(path):
+            path = os.path.join(str(trainer.default_root_dir), path)
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+        self._handle = open(path, "w", encoding="utf-8")
+
+    def on_train_batch_end(
+        self,
+        trainer: L.Trainer,
+        pl_module: L.LightningModule,
+        outputs: Any,
+        batch: Any,
+        batch_idx: int,
+    ) -> None:
+        if self._handle is None or not trainer.is_global_zero:
+            return
+        record = {
+            "format": "clight_lightning_metrics_v1",
+            "global_step": int(trainer.global_step),
+            "epoch": int(trainer.current_epoch),
+            "batch_idx": int(batch_idx),
+        }
+        record.update(
+            {
+                key: self.to_jsonable(value)
+                for key, value in trainer.callback_metrics.items()
+                if key.startswith("train/")
+            }
+        )
+        self._handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+        self._handle.flush()
+
+    def on_fit_end(self, trainer: L.Trainer, pl_module: L.LightningModule) -> None:
+        if self._handle is not None:
+            self._handle.close()
+            self._handle = None

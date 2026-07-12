@@ -261,10 +261,14 @@ class TrainerArguments:
     num_nodes: int = 1
     precision: str = "bf16-mixed"
     fsdp_min_num_params: int = 100_000_000
+    fsdp_param_dtype: str | None = "bfloat16"
+    fsdp_reduce_dtype: str | None = "float32"
+    fsdp_buffer_dtype: str | None = "float32"
     fsdp_cpu_offload: bool = False
     fsdp_use_orig_params: bool = False
     fsdp_forward_prefetch: bool = False
     fsdp_ignore_lm_head: bool = False
+    metrics_jsonl: str | None = None
     max_epochs: int = 1
     max_steps: int = -1
     accumulate_grad_batches: int = 1
@@ -290,10 +294,14 @@ class TrainerArguments:
             "merge_lora_before_export",
             "resume_from_checkpoint",
             "fsdp_min_num_params",
+            "fsdp_param_dtype",
+            "fsdp_reduce_dtype",
+            "fsdp_buffer_dtype",
             "fsdp_cpu_offload",
             "fsdp_use_orig_params",
             "fsdp_forward_prefetch",
             "fsdp_ignore_lm_head",
+            "metrics_jsonl",
         }
         kwargs = {key: value for key, value in vars(self).items() if key not in app_keys}
         kwargs["default_root_dir"] = self.save_dir

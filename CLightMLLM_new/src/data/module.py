@@ -576,6 +576,7 @@ class SupervisedPreprocessor:
 class DatasetAttr:
     data_path: str
     load_from: Literal["parquet", "json", "hf_hub"] = "parquet"
+    formatting: Literal["sharegpt", "verl_prompt"] = "sharegpt"
     subset: str | None = None
     # Root directory for relative image paths in local JSON datasets.
     json_image_root: str | None = None
@@ -656,6 +657,69 @@ class ShareGPTConverter:
             "_response": response_turn,
             "_system": system_prompt,
             "_images": image_inputs,
+        }
+
+
+@dataclass
+class VERLPromptConverter:
+    dataset_attr: DatasetAttr
+
+    def normalize_images(self, images: Any) -> list[Any] | None:
+        if images is None:
+            return None
+        return images[:] if isinstance(images, list) else [images]
+
+    def normalize_content(self, content: Any) -> str:
+        if isinstance(content, str):
+            return content
+        if isinstance(content, list):
+            pieces = []
+            for item in content:
+                if isinstance(item, str):
+                    pieces.append(item)
+                elif isinstance(item, dict):
+                    item_type = item.get("type")
+                    if item_type == "text":
+                        pieces.append(str(item.get("text", "")))
+                    elif item_type == "image":
+                        pieces.append(IMAGE_PLACEHOLDER)
+                    else:
+                        pieces.append(str(item.get("text", item.get("content", ""))))
+                else:
+                    pieces.append(str(item))
+            return "".join(pieces)
+        return str(content)
+
+    def normalize_prompt(self, raw_prompt: Any) -> tuple[str, list[dict[str, str]]]:
+        if raw_prompt is None:
+            return "", []
+        turns = raw_prompt[:] if isinstance(raw_prompt, list) else [raw_prompt]
+        system_prompt = ""
+        prompt: list[dict[str, str]] = []
+        for turn in turns:
+            if isinstance(turn, dict):
+                role = str(turn.get("role", "user"))
+                content = self.normalize_content(turn.get("content", ""))
+            else:
+                role = "user"
+                content = self.normalize_content(turn)
+            if role == "system":
+                system_prompt = content
+            elif role in {"user", "assistant"}:
+                prompt.append({"role": role, "content": content})
+        return system_prompt, prompt
+
+    def __call__(self, example: dict[str, Any]) -> dict[str, Any]:
+        attr = self.dataset_attr
+        system_prompt, prompt = self.normalize_prompt(example[attr.messages])
+        images = self.normalize_images(example[attr.images]) if attr.images else None
+        return {
+            "_prompt": prompt,
+            # OPD uses prompt-only on-policy rollouts; keep a dummy assistant turn so
+            # the existing SFT preprocessor/collator can produce standard fields.
+            "_response": [{"role": "assistant", "content": ""}],
+            "_system": system_prompt,
+            "_images": images,
         }
 
 
@@ -762,7 +826,12 @@ class DatasetBuilder:
         return (not self.data_args.overwrite_cache) or self.trainer.local_rank != 0
 
     def align(self, dataset: Any, dataset_attr: DatasetAttr) -> Any:
-        converter = ShareGPTConverter(dataset_attr)
+        if dataset_attr.formatting == "sharegpt":
+            converter = ShareGPTConverter(dataset_attr)
+        elif dataset_attr.formatting == "verl_prompt":
+            converter = VERLPromptConverter(dataset_attr)
+        else:
+            raise ValueError(f"Unsupported dataset formatting: {dataset_attr.formatting}")
         column_names = list(next(iter(dataset)).keys())
         return dataset.map(
             converter,

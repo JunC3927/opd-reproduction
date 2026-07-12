@@ -138,5 +138,14 @@
       "messages": "conversations",
       "images": "image"
     }
+  },
+  "geo3k_j40004_verl_prompt": {
+    "load_from": "parquet",
+    "file_name_or_path": "/work/03/gw42/j40004/cj/data/geo3k/train.parquet",
+    "formatting": "verl_prompt",
+    "columns": {
+      "messages": "prompt",
+      "images": "images"
+    }
   }
 }
