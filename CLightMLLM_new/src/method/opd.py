@@ -325,10 +325,12 @@ class OPDLearner(RolloutMixin, BaseLearner):
         names = [name for name, _tensor in weights]
         name_set = set(names)
         preferred = (
-            "model.language_model.layers.0.self_attn.q_proj.weight",
             "model.language_model.layers.0.self_attn.o_proj.weight",
             "model.language_model.layers.0.mlp.down_proj.weight",
-            "model.language_model.layers.1.self_attn.q_proj.weight",
+            "model.language_model.layers.0.mlp.up_proj.weight",
+            "model.language_model.layers.0.mlp.gate_proj.weight",
+            "model.language_model.layers.0.self_attn.q_proj.weight",
+            "model.language_model.layers.1.self_attn.o_proj.weight",
             "model.language_model.layers.1.mlp.down_proj.weight",
         )
         for name in preferred:
@@ -336,11 +338,11 @@ class OPDLearner(RolloutMixin, BaseLearner):
                 return name
 
         suffixes = (
-            ".self_attn.q_proj.weight",
             ".self_attn.o_proj.weight",
             ".mlp.down_proj.weight",
-            ".mlp.gate_proj.weight",
             ".mlp.up_proj.weight",
+            ".mlp.gate_proj.weight",
+            ".self_attn.q_proj.weight",
         )
         for name in names:
             if ".layers." in name and name.endswith(suffixes):

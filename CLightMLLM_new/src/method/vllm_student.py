@@ -141,6 +141,14 @@ def _candidate_vllm_weight_names(name: str) -> list[str]:
     if name.startswith("language_model."):
         candidates.append(name[len("language_model.") :])
 
+    packed_attention_candidates = []
+    for candidate in candidates:
+        for proj_name in ("q_proj", "k_proj", "v_proj"):
+            marker = f".self_attn.{proj_name}."
+            if marker in candidate:
+                packed_attention_candidates.append(candidate.replace(marker, ".self_attn.qkv_proj.", 1))
+    candidates.extend(packed_attention_candidates)
+
     result = []
     seen = set()
     for candidate in candidates:
