@@ -47,10 +47,7 @@ from replay_verl_opd_trace import (  # noqa: E402
     init_swanlab,
     load_trace,
     log_swanlab_metrics,
-    model_grad_dtype_counts,
-    model_param_dtype_counts,
     normalize_mm_inputs,
-    optimizer_state_dtype_counts,
     parse_yaml_args,
     sanitize_teacher_ids,
     sync_cuda,
@@ -58,12 +55,9 @@ from replay_verl_opd_trace import (  # noqa: E402
     validate_token_ids,
 )
 from replay_verl_opd_trace_fsdp import (  # noqa: E402
-    compute_fsdp_update_stats,
-    format_update_probe_names,
     init_distributed,
     reduce_sum,
     save_fsdp_hf_model,
-    select_fsdp_update_probes,
     split_contiguous_rows,
 )
 from src.method.vllm_teacher_client import RemoteTeacherScorer  # noqa: E402
@@ -88,16 +82,6 @@ def progress_write(progress: Any, message: str) -> None:
         progress.write(message)
     else:
         print(message, flush=True)
-
-
-def debug_progress_log(args: argparse.Namespace, message: str, *, progress: Any = None, rank0_only: bool = True) -> None:
-    if not getattr(args, "debug_progress", True):
-        return
-    if rank0_only and not is_rank0():
-        return
-    prefix = time.strftime("%Y-%m-%d %H:%M:%S")
-    rank = int(os.environ.get("RANK", "0"))
-    progress_write(progress, f"[progress {prefix} rank={rank}] {message}")
 
 
 def estimate_initial_total_updates(
@@ -399,14 +383,6 @@ def iter_geo3k_parquet_payloads(
         row_indices = list(range(total))
     features: list[dict[str, Any]] = []
     for step_index, row_index in enumerate(row_indices):
-        if step_index == 0 or (
-            args.debug_progress_interval > 0 and step_index % args.debug_progress_interval == 0
-        ):
-            debug_progress_log(
-                args,
-                f"parquet_encode epoch={epoch} row={step_index}/{total}",
-                progress=progress,
-            )
         row = dataset[int(row_index)]
         feature = build_verl_geo3k_feature(
             row=row,
@@ -416,12 +392,6 @@ def iter_geo3k_parquet_payloads(
         )
         features.append(feature)
         if len(features) == samples_per_update:
-            debug_progress_log(
-                args,
-                f"parquet_batch_ready epoch={epoch} rows={step_index + 1 - samples_per_update}:{step_index + 1} "
-                f"prompt_width={max(len(item['prompt_input_ids']) for item in features)} shuffle={args.parquet_shuffle}",
-                progress=progress,
-            )
             yield features_to_trace_payload(features=features, pad_token_id=pad_token_id)
             features = []
 
@@ -621,12 +591,6 @@ def generate_local_sequences(
     pad_token_id = int(tokenizer.pad_token_id)
     use_kv_cache = args.rollout_backend in {"manual_cache", "hf_generate"}
     past_key_values = None
-    rollout_start_time = time.time()
-    debug_progress_log(
-        args,
-        f"rollout_local_start rows={row_start}:{row_end} local_bsz={row_end - row_start} "
-        f"prompt_width={prompt_width} response_width={response_width} backend={args.rollout_backend}",
-    )
 
     with torch.no_grad():
         if args.rollout_backend in {"vllm_single", "vllm_ipc"}:
@@ -663,16 +627,9 @@ def generate_local_sequences(
             input_ids = torch.cat([batch["prompts"][row_start:row_end].cpu().long(), responses_cpu], dim=1)
             prompt_attention_mask = batch["attention_mask"][row_start:row_end, :prompt_width].cpu().long()
             attention_mask_cpu = torch.cat([prompt_attention_mask, response_mask], dim=1)
-            debug_progress_log(
-                args,
-                f"rollout_vllm_done rows={row_start}:{row_end} seconds={time.time() - rollout_start_time:.1f} "
-                f"response_tokens={int(response_mask.sum().item())}",
-            )
             return input_ids, attention_mask_cpu, response_mask
 
         for step in range(response_width):
-            if step == 0:
-                debug_progress_log(args, f"generate_token_start rows={row_start}:{row_end}")
             if use_kv_cache and past_key_values is not None:
                 input_ids = sequences[:, -1:]
                 forward_kwargs = {
@@ -713,16 +670,6 @@ def generate_local_sequences(
             if eos_token_id is not None:
                 finished = finished | next_token.eq(int(eos_token_id))
 
-            if args.debug_progress_interval > 0 and (
-                step == 0 or (step + 1) % args.debug_progress_interval == 0 or step + 1 == response_width
-            ):
-                debug_progress_log(
-                    args,
-                    f"generate_token rows={row_start}:{row_end} step={step + 1}/{response_width} "
-                    f"finished_local={int(finished.sum().item())}/{finished.numel()} "
-                    f"elapsed={time.time() - rollout_start_time:.1f}s",
-                )
-
             # FSDP forward contains collectives, so all ranks must run the same
             # number of generation iterations. Only stop early when every rank
             # has finished all of its local samples.
@@ -748,11 +695,6 @@ def generate_local_sequences(
     input_ids = torch.cat([batch["prompts"][row_start:row_end].cpu().long(), responses_cpu], dim=1)
     prompt_attention_mask = batch["attention_mask"][row_start:row_end, :prompt_width].cpu().long()
     attention_mask = torch.cat([prompt_attention_mask, response_mask], dim=1)
-    debug_progress_log(
-        args,
-        f"rollout_local_done rows={row_start}:{row_end} seconds={time.time() - rollout_start_time:.1f} "
-        f"response_tokens={int(response_mask.sum().item())}",
-    )
     return input_ids, attention_mask, response_mask
 
 
@@ -947,14 +889,6 @@ def batched_teacher_score(
         global_images = flatten_gathered(gathered_objects, "images")
         global_mm_kwargs = flatten_gathered(gathered_objects, "mm_kwargs")
         global_mm_data = flatten_gathered(gathered_objects, "mm_data")
-        rpc_start = time.time()
-        debug_progress_log(
-            args,
-            f"teacher_rpc_start step={update_step} global_shape={tuple(global_sequences.shape)} "
-            f"global_response_tokens={int(global_response_mask.sum().item())} "
-            f"global_images={sum(len(images) for images in global_images)} topk={topk}",
-            progress=progress,
-        )
         teacher_logps, teacher_ids = scorer.score(
             sequences=global_sequences,
             attention_mask=global_attention_mask,
@@ -965,12 +899,6 @@ def batched_teacher_score(
             pad_token_id=pad_token_id,
             mm_processor_kwargs_per_sample=global_mm_kwargs,
             multi_modal_data_per_sample=global_mm_data,
-        )
-        debug_progress_log(
-            args,
-            f"teacher_rpc_done step={update_step} global_teacher_shape={tuple(teacher_ids.shape)} "
-            f"seconds={time.time() - rpc_start:.1f}",
-            progress=progress,
         )
         teacher_logps = teacher_logps.to(device=device, dtype=torch.float32).contiguous()
         teacher_ids = teacher_ids.to(device=device, dtype=torch.long).contiguous()
@@ -1102,23 +1030,23 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--swanlab-logdir", default=None)
     parser.add_argument("--fsdp-min-num-params", type=int, default=10_000_000)
     parser.add_argument("--gradient-checkpointing", action="store_true")
-    parser.add_argument("--debug-dtypes", action="store_true")
     parser.add_argument(
         "--debug-progress",
         action=argparse.BooleanOptionalAction,
         default=False,
-        help="Print rank-0 stage/timing logs for dataset encoding, rollout, teacher scoring, and train step.",
+        help=argparse.SUPPRESS,
     )
     parser.add_argument(
         "--debug-progress-interval",
         type=int,
         default=32,
-        help="Print progress every N parquet rows / generated tokens. Set <=0 to only print major stages.",
+        help=argparse.SUPPRESS,
     )
+    parser.add_argument("--debug-dtypes", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--no-progress", action="store_true", help="Disable the rank-0 tqdm progress bar.")
-    parser.add_argument("--disable-update-probe", action="store_true")
-    parser.add_argument("--update-probe-samples", type=int, default=64)
-    parser.add_argument("--update-probe-max-params", type=int, default=1)
+    parser.add_argument("--disable-update-probe", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--update-probe-samples", type=int, default=64, help=argparse.SUPPRESS)
+    parser.add_argument("--update-probe-max-params", type=int, default=1, help=argparse.SUPPRESS)
     parser.add_argument("--dump-traces", action="store_true")
     parser.add_argument("--dump-trace-dir", default=None)
     parser.add_argument("--parquet-max-rows", type=int, default=0, help="Limit Geo3K parquet rows for smoke tests.")
@@ -1167,16 +1095,10 @@ def build_student_vllm_rollout(
     tokenizer: Any,
     local_rank: int,
 ) -> VLLMStudentRollout:
-    rank_print("student_vllm_init_start=True")
     os.environ.setdefault("VLLM_USE_V1", "1")
     os.environ.setdefault("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
     if args.rollout_backend == "vllm_ipc" and os.environ.get("VLLM_ENABLE_V1_MULTIPROCESSING") == "0":
-        rank_print("student_vllm_enable_v1_multiprocessing_override=0_to_1")
         os.environ["VLLM_ENABLE_V1_MULTIPROCESSING"] = "1"
-    rank_print(f"student_vllm_use_v1={os.environ.get('VLLM_USE_V1')}")
-    rank_print(f"student_vllm_worker_multiproc_method={os.environ.get('VLLM_WORKER_MULTIPROC_METHOD')}")
-    if os.environ.get("VLLM_ENABLE_V1_MULTIPROCESSING") is not None:
-        rank_print(f"student_vllm_enable_v1_multiprocessing={os.environ.get('VLLM_ENABLE_V1_MULTIPROCESSING')}")
     if model_args.model_name_or_path is None:
         raise ValueError(f"rollout_backend={args.rollout_backend} requires model.model_name_or_path in the config.")
     rollout = VLLMStudentRollout(
@@ -1195,7 +1117,6 @@ def build_student_vllm_rollout(
         seed=0,
         limit_mm_per_prompt={"image": 1, "video": 0},
     )
-    rank_print("student_vllm_init_done=True")
     return rollout
 
 
@@ -1225,7 +1146,6 @@ def main() -> None:
     pre_dist_rank = int(os.environ.get("RANK", "0"))
     pre_dist_local_rank = int(os.environ.get("LOCAL_RANK", "0"))
     if args.rollout_backend in {"vllm_single", "vllm_ipc"} and pre_dist_rank == 0:
-        rank_print("student_vllm_pre_distributed_init=True")
         _student_processor, student_tokenizer, _common_kwargs = load_processor_and_tokenizer(model_args)
         student_rollout = build_student_vllm_rollout(
             args=args,
@@ -1289,8 +1209,6 @@ def main() -> None:
     parquet_len: int | None = None
     if args.data_source == "geo3k_parquet":
         parquet_dataset_config = make_verl_parquet_config(args)
-        debug_progress_log(args, f"parquet_dataset_build_start paths={len(paths)}")
-        parquet_build_start = time.time()
         parquet_dataset = build_geo3k_parquet_dataset(
             paths=paths,
             processor=processor,
@@ -1299,12 +1217,6 @@ def main() -> None:
             max_rows=args.parquet_max_rows,
         )
         parquet_len = int(len(parquet_dataset))
-        debug_progress_log(
-            args,
-            f"parquet_dataset_build_done rows={parquet_len} "
-            f"updates_per_epoch={parquet_len // args.samples_per_update} "
-            f"seconds={time.time() - parquet_build_start:.1f}",
-        )
     if args.rollout_backend in {"vllm_single", "vllm_ipc"} and is_rank0():
         if student_rollout is None:
             student_rollout = build_student_vllm_rollout(
@@ -1318,49 +1230,61 @@ def main() -> None:
             student_rollout.tokenizer = tokenizer
     if args.rollout_backend == "vllm_ipc":
         dist.barrier()
-        rank_print("student_vllm_init_barrier_done=True")
 
     rank_print("=== online hf opd fsdp ===")
     rank_print(f"config={args.config}")
-    rank_print(f"data_source={args.data_source}")
-    rank_print(f"source_count={len(paths)}")
-    rank_print(f"world_size={world_size}")
-    rank_print(f"local_rank={local_rank}")
-    rank_print(f"samples_per_update={args.samples_per_update}")
-    rank_print(f"local_samples_per_rank={args.samples_per_update // world_size}")
-    rank_print(f"micro_batch_size={args.micro_batch_size}")
-    rank_print(f"epochs={args.epochs}")
-    rank_print(f"response_width={args.response_width}")
-    rank_print(f"rollout_backend={args.rollout_backend}")
+    rank_print(
+        " | ".join(
+            [
+                f"data_source={args.data_source}",
+                f"sources={len(paths)}",
+                f"world_size={world_size}",
+                f"samples/update={args.samples_per_update}",
+                f"local/rank={args.samples_per_update // world_size}",
+                f"epochs={args.epochs}",
+                f"response_width={args.response_width}",
+                f"rollout={args.rollout_backend}",
+                f"teacher={args.teacher_host}:{args.teacher_port}",
+            ]
+        )
+    )
     if args.data_source == "geo3k_parquet" and parquet_dataset_config is not None:
-        rank_print(f"parquet_prompt_key={parquet_dataset_config.prompt_key}")
-        rank_print(f"parquet_image_key={parquet_dataset_config.image_key}")
-        rank_print(f"parquet_max_prompt_length={parquet_dataset_config.max_prompt_length}")
-        rank_print(f"parquet_filter_overlong_prompts={parquet_dataset_config.filter_overlong_prompts}")
-        rank_print(f"parquet_shuffle={args.parquet_shuffle}")
-        rank_print(f"parquet_shuffle_seed={args.parquet_shuffle_seed}")
+        rank_print(
+            " | ".join(
+                [
+                    f"parquet_rows={parquet_len}",
+                    f"prompt_key={parquet_dataset_config.prompt_key}",
+                    f"image_key={parquet_dataset_config.image_key}",
+                    f"max_prompt={parquet_dataset_config.max_prompt_length}",
+                    f"shuffle={args.parquet_shuffle}",
+                    f"shuffle_seed={args.parquet_shuffle_seed}",
+                ]
+            )
+        )
     if args.rollout_backend in {"vllm_single", "vllm_ipc"}:
-        rank_print(f"student_vllm_dtype={args.student_vllm_dtype}")
-        rank_print(f"student_vllm_device={args.student_vllm_device or f'cuda:{local_rank}'}")
-        rank_print(f"student_vllm_gpu_memory_utilization={args.student_vllm_gpu_memory_utilization}")
-        rank_print(f"student_vllm_max_model_len={args.student_vllm_max_model_len}")
-        if args.rollout_backend == "vllm_ipc":
-            rank_print("student_vllm_rank0_colocated=True")
-            rank_print("student_vllm_rank0_colocated_warning=A100_40GB_may_OOM; use smoke max-updates first")
-            rank_print(f"student_vllm_ipc_bucket_mb={args.student_vllm_ipc_bucket_mb}")
-            rank_print(f"student_vllm_ipc_use_shm={args.student_vllm_ipc_use_shm}")
-            rank_print(f"student_vllm_sync_dtype={args.student_vllm_sync_dtype}")
-    rank_print(f"teacher={args.teacher_host}:{args.teacher_port}")
-    rank_print(f"generate_amp_dtype={args.generate_amp_dtype}")
-    rank_print(f"train_amp_dtype={args.train_amp_dtype}")
-    rank_print(f"learning_rate={optimizer_args.learning_rate}")
-    rank_print(f"fsdp_min_num_params={args.fsdp_min_num_params}")
+        rank_print(
+            " | ".join(
+                [
+                    f"student_vllm_dtype={args.student_vllm_dtype}",
+                    f"student_vllm_device={args.student_vllm_device or f'cuda:{local_rank}'}",
+                    f"student_vllm_mem={args.student_vllm_gpu_memory_utilization}",
+                    f"student_vllm_len={args.student_vllm_max_model_len}",
+                ]
+            )
+        )
+    rank_print(
+        " | ".join(
+            [
+                f"generate_amp={args.generate_amp_dtype}",
+                f"train_amp={args.train_amp_dtype}",
+                f"lr={optimizer_args.learning_rate}",
+                f"micro_bsz={args.micro_batch_size}",
+                f"fsdp_min_params={args.fsdp_min_num_params}",
+            ]
+        )
+    )
     rank_print(f"trainable_params={trainable} total_params={total}")
     rank_print(f"student_vocab_size={vocab_size}")
-    if args.debug_dtypes and is_rank0():
-        print(f"[dtype] fsdp_param_dtypes={model_param_dtype_counts(model)}", flush=True)
-        print(f"[dtype] fsdp_trainable_param_dtypes={model_param_dtype_counts(model, trainable_only=True)}", flush=True)
-        print(f"[dtype] optimizer_defaults={optimizer.defaults}", flush=True)
 
     metrics_output = None
     if is_rank0():
@@ -1467,13 +1391,6 @@ def main() -> None:
                     row_end = group_start + local_offset_end
                     update_step += 1
                     update_wall_start = time.time()
-                    debug_progress_log(
-                        args,
-                        f"update_start step={update_step} epoch={epoch} source={source_name} "
-                        f"group_rows={group_start}:{group_end} local_rows={row_start}:{row_end} "
-                        f"prompt_width={prompt_width}",
-                        progress=progress,
-                    )
 
                     rollout_metrics: dict[str, float | int | str] = {}
                     if args.rollout_backend == "vllm_single" and student_rollout is not None:
@@ -1526,14 +1443,6 @@ def main() -> None:
                             args=args,
                         )
                         rollout_metrics["student_rollout_sec"] = float(time.time() - rollout_start_time)
-                        debug_progress_log(
-                            args,
-                            f"rollout_done step={update_step} local_shape={tuple(local_sequences_cpu.shape)} "
-                            f"local_response_tokens={int(local_response_mask_cpu.sum().item())} "
-                            f"seconds={rollout_metrics['student_rollout_sec']:.1f}",
-                            progress=progress,
-                        )
-                    seq_len = int(local_sequences_cpu.shape[1])
                     local_sequences = local_sequences_cpu.to(device)
                     local_attention = local_attention_cpu.to(device)
                     local_response_mask = local_response_mask_cpu.to(device=device, dtype=torch.float32)
@@ -1544,12 +1453,6 @@ def main() -> None:
                     )
 
                     teacher_start_time = time.time()
-                    debug_progress_log(
-                        args,
-                        f"teacher_score_start step={update_step} local_seq_shape={tuple(local_sequences.shape)} "
-                        f"local_images={sum(len(images) for images in local_images)}",
-                        progress=progress,
-                    )
                     local_teacher_logps, local_teacher_ids = batched_teacher_score(
                         args=args,
                         progress=progress,
@@ -1568,12 +1471,6 @@ def main() -> None:
                         device=device,
                     )
                     teacher_sec = time.time() - teacher_start_time
-                    debug_progress_log(
-                        args,
-                        f"teacher_score_done step={update_step} teacher_shape={tuple(local_teacher_ids.shape)} "
-                        f"seconds={teacher_sec:.1f}",
-                        progress=progress,
-                    )
                     validate_token_ids(
                         f"online step {update_step} generated input_ids local",
                         local_sequences,
@@ -1589,26 +1486,12 @@ def main() -> None:
                     actual_token_count = torch.tensor(0.0, device=device)
 
                     optimizer.zero_grad(set_to_none=True)
-                    if args.disable_update_probe:
-                        update_probes = []
-                    else:
-                        update_probes = select_fsdp_update_probes(
-                            model,
-                            samples_per_param=args.update_probe_samples,
-                            max_params=args.update_probe_max_params,
-                        )
 
                     response_start = prompt_width + int(args.teacher_shift_offset)
                     if response_start < 0:
                         raise ValueError(f"Invalid response_start={response_start}.")
 
                     train_start_time = time.time()
-                    debug_progress_log(
-                        args,
-                        f"train_backward_start step={update_step} local_bsz={local_sequences.shape[0]} "
-                        f"seq_len={local_sequences.shape[1]} micro_batch_size={args.micro_batch_size}",
-                        progress=progress,
-                    )
                     for local_start in range(0, local_sequences.shape[0], args.micro_batch_size):
                         local_end = min(local_start + args.micro_batch_size, local_sequences.shape[0])
                         input_ids = local_sequences[local_start:local_end]
@@ -1685,31 +1568,8 @@ def main() -> None:
                         loss_num_metric += loss_num.detach()
                         micro_loss = loss_num * world_size / global_token_count
 
-                        if args.debug_dtypes and update_step == 1 and local_start == 0 and is_rank0():
-                            print(
-                                "[dtype] first_forward="
-                                + json.dumps(
-                                    {
-                                        "fsdp_param_dtypes": model_param_dtype_counts(model),
-                                        "logits": str(outputs.logits.dtype),
-                                        "student_logits": str(student_logits.dtype),
-                                        "teacher_logps": str(teacher_logps_slice.dtype),
-                                        "loss_num": str(loss_num.dtype),
-                                        "micro_loss": str(micro_loss.dtype),
-                                    },
-                                    sort_keys=True,
-                                ),
-                                flush=True,
-                            )
-
                         micro_loss.backward()
                         sync_cuda(device, f"online step {update_step} rows {abs_start}:{abs_end} backward")
-                        debug_progress_log(
-                            args,
-                            f"micro_backward_done step={update_step} rows={abs_start}:{abs_end} "
-                            f"micro_loss={float(micro_loss.detach().item()):.6f}",
-                            progress=progress,
-                        )
 
                         with torch.no_grad():
                             token_count = response_mask.sum()
@@ -1729,24 +1589,11 @@ def main() -> None:
                     global_actual_token_count = reduce_sum(actual_token_count.detach().clone()).clamp_min(1.0)
                     loss_value = global_loss_num / global_token_count
 
-                    if args.debug_dtypes and update_step == 1 and is_rank0():
-                        print(f"[dtype] grad_dtypes_before_step={model_grad_dtype_counts(model)}", flush=True)
                     grad_value = torch.tensor(0.0, device=device)
                     if args.grad_clip is not None and args.grad_clip > 0:
                         grad_value = model.clip_grad_norm_(args.grad_clip).detach()
                     optimizer.step()
                     train_sec = time.time() - train_start_time
-                    debug_progress_log(
-                        args,
-                        f"optimizer_step_done step={update_step} train_seconds={train_sec:.1f}",
-                        progress=progress,
-                    )
-                    if args.debug_dtypes and update_step == 1 and is_rank0():
-                        print(
-                            f"[dtype] optimizer_state_dtypes_after_step={optimizer_state_dtype_counts(optimizer)}",
-                            flush=True,
-                        )
-                    update_stats = compute_fsdp_update_stats(model, update_probes)
 
                     maybe_dump_online_trace(
                         args=args,
@@ -1788,7 +1635,6 @@ def main() -> None:
                             "student_mass": float((global_student_mass_num / global_actual_token_count).detach().cpu().item()),
                             "topk_overlap": float((global_overlap_num / global_actual_token_count).detach().cpu().item()),
                             "grad_norm": float(grad_value.detach().cpu().item()),
-                            "update_param": format_update_probe_names(update_probes),
                             "response_len_mean": float(sum(flat_lengths) / max(len(flat_lengths), 1)),
                             "response_len_max": float(max(flat_lengths) if flat_lengths else 0.0),
                             "rollout_backend": args.rollout_backend,
@@ -1800,7 +1646,6 @@ def main() -> None:
                             "update_wall_sec": float(time.time() - update_wall_start),
                         }
                         record.update(rollout_metrics)
-                        record.update(update_stats)
                         message = (
                             " | ".join(
                                 [
