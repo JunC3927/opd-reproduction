@@ -80,6 +80,13 @@ class MethodArguments:
     rollout_student_server_host: str = "127.0.0.1"
     rollout_student_server_port: int = 29588
     rollout_student_server_timeout: float = 3600.0
+    rollout_student_server_sync_backend: Literal["none", "remote_ipc_summon"] = "remote_ipc_summon"
+    rollout_student_server_sync_bucket_size_mb: int = 2048
+    rollout_student_server_sync_use_shm: bool = False
+    rollout_student_server_sync_device: str | None = None
+    rollout_student_server_sync_dtype: str | None = "none"
+    rollout_student_server_summon_rank0_only: bool = True
+    rollout_student_server_summon_offload_to_cpu: bool = False
     grpo_reward_type: Literal["reference_match", "length", "none"] = "reference_match"
     grpo_kl_coef: float = 0.0
     grpo_reference_model: bool = False
@@ -143,6 +150,12 @@ class MethodArguments:
             raise ValueError("method.rollout_student_server_port must be positive.")
         if self.rollout_student_server_timeout <= 0:
             raise ValueError("method.rollout_student_server_timeout must be positive.")
+        if self.rollout_student_server_sync_bucket_size_mb <= 0:
+            raise ValueError("method.rollout_student_server_sync_bucket_size_mb must be positive.")
+        if self.rollout_student_server_sync_dtype is not None:
+            sync_dtype = str(self.rollout_student_server_sync_dtype).lower()
+            if sync_dtype not in {"none", "null"}:
+                parse_torch_dtype(sync_dtype)
         if self.grpo_kl_coef < 0:
             raise ValueError("method.grpo_kl_coef must be non-negative.")
         if self.opd_alpha < 0:

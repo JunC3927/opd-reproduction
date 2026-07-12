@@ -1,13 +1,17 @@
+import contextlib
 import os
+import time
 from typing import Any
 
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
+from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 
+from ..hparams import parse_torch_dtype
 from .base import BaseLearner
 from .rollout import RolloutMixin
-from .vllm_student import VLLMStudentRollout
+from .vllm_student import VLLMStudentRollout, describe_weight_items_for_ipc
 from .vllm_student_client import RemoteStudentRollout
 from .vllm_teacher import VLLMTeacherScorer
 from .vllm_teacher_client import RemoteTeacherScorer, RemoteVLLMTeacherScorer
@@ -54,11 +58,14 @@ class OPDLearner(RolloutMixin, BaseLearner):
                 ),
             )
         elif self.method_args.rollout_backend == "vllm_student_server":
-            if self.method_args.rollout_vllm_sync_after_optimizer_step:
+            if (
+                self.method_args.rollout_vllm_sync_after_optimizer_step
+                and self.method_args.rollout_student_server_sync_backend != "remote_ipc_summon"
+            ):
                 raise ValueError(
-                    "method.rollout_backend='vllm_student_server' currently supports rollout smoke only. "
-                    "Set method.rollout_vllm_sync_after_optimizer_step=false until remote FSDP weight sync "
-                    "is enabled in the Lightning hook."
+                    "method.rollout_backend='vllm_student_server' with "
+                    "method.rollout_vllm_sync_after_optimizer_step=true requires "
+                    "method.rollout_student_server_sync_backend='remote_ipc_summon'."
                 )
             object.__setattr__(
                 self,
@@ -161,6 +168,10 @@ class OPDLearner(RolloutMixin, BaseLearner):
         current_step = int(getattr(self.trainer, "global_step", 0))
         if current_step <= self._last_student_rollout_sync_step:
             return
+        if isinstance(self.student_rollout, RemoteStudentRollout):
+            self._sync_remote_student_rollout(current_step=current_step)
+            self._last_student_rollout_sync_step = current_step
+            return
         sync_from_hf_model = getattr(self.student_rollout, "sync_from_hf_model", None)
         if not callable(sync_from_hf_model):
             raise RuntimeError(
@@ -170,6 +181,177 @@ class OPDLearner(RolloutMixin, BaseLearner):
             )
         sync_from_hf_model(self.model)
         self._last_student_rollout_sync_step = current_step
+
+    def _sync_remote_student_rollout(self, *, current_step: int) -> None:
+        if self.method_args.rollout_student_server_sync_backend != "remote_ipc_summon":
+            raise RuntimeError(
+                "Remote student rollout sync only supports "
+                "method.rollout_student_server_sync_backend='remote_ipc_summon'."
+            )
+        if not isinstance(self.student_rollout, RemoteStudentRollout):
+            raise RuntimeError("Remote student rollout sync requires a RemoteStudentRollout client.")
+
+        fsdp_model = self._find_fsdp_summon_module()
+        if fsdp_model is None:
+            raise RuntimeError(
+                "Remote student rollout sync requires a Lightning FSDP-wrapped model. "
+                "No FullyShardedDataParallel module was found."
+            )
+
+        rank = self._dist_rank()
+        local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+        sync_dtype = self._remote_sync_dtype()
+        start = time.time()
+        print(
+            f"[student-vllm-sync rank={rank}] remote weight sync start: "
+            f"step={current_step}, backend=remote_ipc_summon, "
+            f"rank0_only={self.method_args.rollout_student_server_summon_rank0_only}, "
+            f"offload_to_cpu={self.method_args.rollout_student_server_summon_offload_to_cpu}",
+            flush=True,
+        )
+
+        response = None
+        with self._summon_full_params_compat(
+            fsdp_model,
+            rank0_only=bool(self.method_args.rollout_student_server_summon_rank0_only),
+            offload_to_cpu=bool(self.method_args.rollout_student_server_summon_offload_to_cpu),
+        ):
+            print(
+                f"[student-vllm-sync rank={rank}] FSDP summon_full_params entered: "
+                f"step={current_step}, seconds={time.time() - start:.3f}",
+                flush=True,
+            )
+            if rank == 0:
+                weights = self._student_model_weight_items()
+                weight_stats = describe_weight_items_for_ipc(weights, sync_dtype=sync_dtype)
+                print(
+                    "[student-vllm-sync rank=0] weight views ready: "
+                    f"step={current_step}, tensors={len(weights)}, sync_dtype={sync_dtype}, "
+                    f"bucket_size_mb={self.method_args.rollout_student_server_sync_bucket_size_mb}, "
+                    f"use_shm={self.method_args.rollout_student_server_sync_use_shm}, "
+                    f"weight_stats={weight_stats}",
+                    flush=True,
+                )
+                response = self.student_rollout.sync_weight_items_ipc(
+                    weights,
+                    bucket_size_mb=int(self.method_args.rollout_student_server_sync_bucket_size_mb),
+                    use_shm=bool(self.method_args.rollout_student_server_sync_use_shm),
+                    device=self.method_args.rollout_student_server_sync_device,
+                    sync_dtype=sync_dtype,
+                )
+                print(
+                    "[student-vllm-sync rank=0] remote weight sync done: "
+                    f"step={current_step}, seconds={time.time() - start:.3f}, "
+                    f"weight_version={response.get('weight_version')}, "
+                    f"summary={response.get('summary')}",
+                    flush=True,
+                )
+            self._dist_barrier("inside-remote-student-sync", local_rank=local_rank)
+        self._dist_barrier("post-remote-student-sync", local_rank=local_rank)
+        if rank != 0:
+            print(
+                f"[student-vllm-sync rank={rank}] remote weight sync done: "
+                f"step={current_step}, seconds={time.time() - start:.3f}",
+                flush=True,
+            )
+
+    def _student_model_weight_items(self) -> list[tuple[str, torch.Tensor]]:
+        weights: list[tuple[str, torch.Tensor]] = []
+        seen: set[str] = set()
+        for name, param in self.model.named_parameters():
+            if not torch.is_tensor(param):
+                continue
+            normalized = self._normalize_summoned_param_name(name)
+            if normalized in seen:
+                continue
+            seen.add(normalized)
+            weights.append((normalized, param.detach()))
+        return weights
+
+    def _remote_sync_dtype(self) -> torch.dtype | None:
+        value = self.method_args.rollout_student_server_sync_dtype
+        if value is None:
+            return None
+        if str(value).lower() in {"none", "null"}:
+            return None
+        return parse_torch_dtype(str(value))
+
+    def _find_fsdp_summon_module(self) -> FSDP | None:
+        candidates = [
+            getattr(getattr(self, "trainer", None), "model", None),
+            getattr(getattr(getattr(self, "trainer", None), "strategy", None), "model", None),
+            self,
+            self.model,
+        ]
+        seen: set[int] = set()
+        for candidate in candidates:
+            if candidate is None or id(candidate) in seen:
+                continue
+            seen.add(id(candidate))
+            if isinstance(candidate, FSDP):
+                return candidate
+            modules = getattr(candidate, "modules", None)
+            if callable(modules):
+                for module in modules():
+                    if isinstance(module, FSDP):
+                        return module
+        return None
+
+    @staticmethod
+    @contextlib.contextmanager
+    def _summon_full_params_compat(
+        fsdp_model: FSDP,
+        *,
+        rank0_only: bool,
+        offload_to_cpu: bool,
+    ):
+        kwargs = {
+            "writeback": False,
+            "recurse": True,
+            "rank0_only": rank0_only,
+            "offload_to_cpu": offload_to_cpu,
+        }
+        try:
+            ctx = FSDP.summon_full_params(fsdp_model, **kwargs)
+        except TypeError:
+            print(
+                "[student-vllm-sync] FSDP.summon_full_params does not accept "
+                "rank0_only/offload_to_cpu; falling back to writeback=False,recurse=True",
+                flush=True,
+            )
+            ctx = FSDP.summon_full_params(fsdp_model, writeback=False, recurse=True)
+        with ctx:
+            yield
+
+    @staticmethod
+    def _normalize_summoned_param_name(name: str) -> str:
+        prefixes = ("_fsdp_wrapped_module.", "module.")
+        changed = True
+        while changed:
+            changed = False
+            for prefix in prefixes:
+                while name.startswith(prefix):
+                    name = name[len(prefix) :]
+                    changed = True
+        return name.replace("._fsdp_wrapped_module.", ".")
+
+    @staticmethod
+    def _dist_rank() -> int:
+        if dist.is_available() and dist.is_initialized():
+            return int(dist.get_rank())
+        return int(os.environ.get("RANK", os.environ.get("LOCAL_RANK", "0")))
+
+    @staticmethod
+    def _dist_barrier(label: str, *, local_rank: int) -> None:
+        if not (dist.is_available() and dist.is_initialized()):
+            return
+        print(f"[student-vllm-sync rank={dist.get_rank()}] {label} barrier start", flush=True)
+        if str(dist.get_backend()).lower() == "nccl" and torch.cuda.is_available():
+            device_id = torch.cuda.current_device()
+            dist.barrier(device_ids=[device_id])
+        else:
+            dist.barrier()
+        print(f"[student-vllm-sync rank={dist.get_rank()}] {label} barrier done", flush=True)
 
     def on_save_checkpoint(self, checkpoint: dict) -> None:
         checkpoint["state_dict"] = {
