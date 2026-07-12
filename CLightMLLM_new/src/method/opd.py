@@ -202,9 +202,9 @@ class OPDLearner(RolloutMixin, BaseLearner):
                     batch=batch,
                     sequences=sequences,
                     attention_mask=attention_mask,
+                    response_mask=response_mask,
                 )
 
-            self.debug_student_param_shapes_once()
             student_outputs = self.model(**self.sequence_model_kwargs(batch, sequences, attention_mask))
             student_logits = student_outputs.logits[:, :-1].float() / self.method_args.opd_temperature
             loss_outputs = self.compute_forward_kl_topk_loss(
@@ -251,6 +251,7 @@ class OPDLearner(RolloutMixin, BaseLearner):
         batch: dict[str, Any],
         sequences: torch.Tensor,
         attention_mask: torch.Tensor,
+        response_mask: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         if self.teacher_scorer is not None:
             config = getattr(self.model, "config", None)
@@ -266,6 +267,8 @@ class OPDLearner(RolloutMixin, BaseLearner):
                 pad_token_id=self.tokenizer.pad_token_id,
                 model_kwargs=model_kwargs,
                 mm_processor_kwargs_per_sample=batch.get("mm_processor_kwargs"),
+                multi_modal_data_per_sample=batch.get("multi_modal_data"),
+                response_mask=response_mask,
             )
 
         assert self.teacher_model is not None
@@ -334,28 +337,6 @@ class OPDLearner(RolloutMixin, BaseLearner):
     @staticmethod
     def masked_mean(values: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
         return (values * mask).sum() / mask.sum().clamp_min(1.0)
-
-    def debug_student_param_shapes_once(self) -> None:
-        if os.environ.get("CLIGHT_FSDP_DEBUG") != "1":
-            return
-        if getattr(self, "_printed_student_param_shapes", False):
-            return
-        object.__setattr__(self, "_printed_student_param_shapes", True)
-
-        if not is_rank_zero_process():
-            return
-
-        pieces = []
-        lm_head = getattr(self.model, "lm_head", None)
-        if lm_head is not None and hasattr(lm_head, "weight"):
-            pieces.append(f"lm_head.weight={tuple(lm_head.weight.shape)}@{lm_head.weight.device}")
-        get_input_embeddings = getattr(self.model, "get_input_embeddings", None)
-        if callable(get_input_embeddings):
-            input_embeddings = get_input_embeddings()
-            weight = getattr(input_embeddings, "weight", None)
-            if weight is not None:
-                pieces.append(f"input_embeddings.weight={tuple(weight.shape)}@{weight.device}")
-        print("CLight student param shapes before forward: " + ", ".join(pieces))
 
     def move_student_io_modules_to_device(self) -> None:
         modules = []
