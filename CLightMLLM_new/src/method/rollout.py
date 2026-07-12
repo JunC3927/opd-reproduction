@@ -326,6 +326,7 @@ class RolloutMixin:
             "temperature": self.method_args.rollout_temperature,
             "top_p": self.method_args.rollout_top_p,
             "top_k": self.method_args.rollout_top_k if self.method_args.rollout_top_k is not None else 0,
+            "use_cache": True,
             "pad_token_id": self.tokenizer.pad_token_id,
             "eos_token_id": self.tokenizer.eos_token_id,
         }
