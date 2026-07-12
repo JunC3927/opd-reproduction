@@ -154,6 +154,7 @@ class TrainingApp:
         )
         reference_model = self.load_teacher_model(model_args, data_args.template, reference_model_path)
         model = ModelTuner(tuning_args).apply(model)
+        self.report_model_parameters(model, prefix="student pre-FSDP")
         template = TemplateFactory.from_args(tokenizer, data_args)
         datamodule = VLSFTDataModule(
             template=template,
@@ -196,6 +197,22 @@ class TrainingApp:
             callbacks=callbacks,
         )
         trainer.fit(module, datamodule=datamodule, ckpt_path=trainer_args.resume_from_checkpoint)
+
+    @staticmethod
+    def report_model_parameters(model: torch.nn.Module, prefix: str) -> None:
+        if not is_rank_zero_process():
+            return
+
+        total = sum(param.numel() for param in model.parameters())
+        trainable = sum(param.numel() for param in model.parameters() if param.requires_grad)
+        non_trainable = total - trainable
+        trainable_pct = 100.0 * trainable / total if total else 0.0
+        print(
+            f"CLight {prefix} params: "
+            f"trainable={trainable:,} total={total:,} non_trainable={non_trainable:,} "
+            f"trainable_pct={trainable_pct:.2f}%",
+            flush=True,
+        )
 
     @staticmethod
     def build_loggers(trainer_args: TrainerArguments) -> list[Any] | bool:
