@@ -149,6 +149,49 @@ class BaseLearner(L.LightningModule):
                 flush=True,
             )
 
+    def configure_gradient_clipping(
+        self,
+        optimizer: torch.optim.Optimizer,
+        gradient_clip_val: float | int | None = None,
+        gradient_clip_algorithm: str | None = None,
+    ) -> None:
+        if gradient_clip_val is None or float(gradient_clip_val) <= 0:
+            return
+
+        algorithm = str(gradient_clip_algorithm or "norm").lower()
+        strategy = getattr(self.trainer, "strategy", None)
+        if strategy is not None and "FSDP" in type(strategy).__name__ and "norm" in algorithm:
+            fsdp_model = self._find_fsdp_clip_module()
+            if fsdp_model is None:
+                raise RuntimeError("Lightning FSDP gradient clipping requested, but no FSDP clip_grad_norm_ module was found.")
+            fsdp_model.clip_grad_norm_(float(gradient_clip_val))
+            return
+
+        self.clip_gradients(
+            optimizer,
+            gradient_clip_val=float(gradient_clip_val),
+            gradient_clip_algorithm=gradient_clip_algorithm,
+        )
+
+    def _find_fsdp_clip_module(self) -> torch.nn.Module | None:
+        candidates = [
+            getattr(getattr(self, "trainer", None), "model", None),
+            getattr(getattr(getattr(self, "trainer", None), "strategy", None), "model", None),
+            self,
+            self.model,
+        ]
+        for candidate in candidates:
+            if candidate is None:
+                continue
+            if callable(getattr(candidate, "clip_grad_norm_", None)):
+                return candidate
+            modules = getattr(candidate, "modules", None)
+            if callable(modules):
+                for module in modules():
+                    if callable(getattr(module, "clip_grad_norm_", None)):
+                        return module
+        return None
+
     def configure_optimizers(self):
         args = self.optimizer_args
         decay, no_decay = [], []
