@@ -5,7 +5,6 @@ from typing import Any
 
 import torch
 import torch.nn.functional as F
-from transformers import GenerationConfig
 
 try:
     from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
@@ -320,18 +319,17 @@ class RolloutMixin:
 
         return kwargs
 
-    def generation_config(self) -> GenerationConfig:
+    def generation_kwargs(self) -> dict[str, Any]:
         kwargs = {
             "max_new_tokens": self.method_args.rollout_max_new_tokens,
             "do_sample": self.method_args.rollout_do_sample,
             "temperature": self.method_args.rollout_temperature,
             "top_p": self.method_args.rollout_top_p,
+            "top_k": self.method_args.rollout_top_k if self.method_args.rollout_top_k is not None else 0,
             "pad_token_id": self.tokenizer.pad_token_id,
             "eos_token_id": self.tokenizer.eos_token_id,
         }
-        if self.method_args.rollout_top_k is not None:
-            kwargs["top_k"] = self.method_args.rollout_top_k
-        return GenerationConfig(**kwargs)
+        return kwargs
 
     def generate_rollout(self, batch: dict[str, Any]) -> torch.Tensor:
         if self.method_args.rollout_backend == "reference":
@@ -354,7 +352,7 @@ class RolloutMixin:
         with torch.no_grad(), self._summon_fsdp_for_generate():
             sequences = self.model.generate(
                 **prompt_inputs,
-                generation_config=self.generation_config(),
+                **self.generation_kwargs(),
             )
         if was_training:
             self.model.train()
