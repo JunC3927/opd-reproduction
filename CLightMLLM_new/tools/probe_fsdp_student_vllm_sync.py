@@ -23,6 +23,7 @@ import gc
 import os
 import sys
 import time
+import traceback
 from dataclasses import fields, replace
 from datetime import timedelta
 from functools import partial
@@ -58,6 +59,7 @@ from src.hparams import (  # noqa: E402
     parse_torch_dtype,
 )
 from src.method.vllm_student_client import RemoteStudentRollout  # noqa: E402
+from src.method.vllm_student import describe_weight_items_for_ipc  # noqa: E402
 from src.method.vllm_student import VLLMStudentRollout  # noqa: E402
 from src.model import ModelTuner, load_vision_language_model  # noqa: E402
 
@@ -389,22 +391,36 @@ def sync_remote_student_from_state_dict(
     sync_dtype: torch.dtype | None,
 ) -> dict[str, Any]:
     weights = state_dict_to_weight_items(state_dict)
+    weight_stats = describe_weight_items_for_ipc(weights, sync_dtype=sync_dtype)
     log(
         "remote student IPC sync start: "
         f"server={host}:{port}, tensors={len(weights)}, sync_device={sync_device}, "
-        f"sync_dtype={sync_dtype}, bucket_size_mb={bucket_size_mb}, use_shm={use_shm}"
+        f"sync_dtype={sync_dtype}, bucket_size_mb={bucket_size_mb}, use_shm={use_shm}, "
+        f"weight_stats={weight_stats}"
     )
+    largest_nbytes = weight_stats.get("largest_nbytes")
+    if use_shm and largest_nbytes is not None and int(largest_nbytes) > (int(bucket_size_mb) << 20):
+        raise ValueError(
+            "Remote SHM sync cannot start because the bucket is smaller than the largest tensor: "
+            f"largest={weight_stats.get('largest_name')} "
+            f"estimated={int(largest_nbytes) / 1024**2:.1f}MiB, "
+            f"bucket_size_mb={bucket_size_mb}. Increase --ipc-bucket-size-mb."
+        )
     client = RemoteStudentRollout(host=host, port=port, timeout=timeout_sec)
     ping = client.ping()
     log(f"remote student ping: {ping}")
     start = time.time()
-    response = client.sync_weight_items_ipc(
-        weights,
-        bucket_size_mb=bucket_size_mb,
-        use_shm=use_shm,
-        device=sync_device,
-        sync_dtype=sync_dtype,
-    )
+    try:
+        response = client.sync_weight_items_ipc(
+            weights,
+            bucket_size_mb=bucket_size_mb,
+            use_shm=use_shm,
+            device=sync_device,
+            sync_dtype=sync_dtype,
+        )
+    except Exception:
+        log("remote student IPC sync failed:\n" + traceback.format_exc())
+        raise
     response["client_total_sec"] = time.time() - start
     log(f"remote student IPC sync done: seconds={response['client_total_sec']:.3f}, response={response}")
     return response
