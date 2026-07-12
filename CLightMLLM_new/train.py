@@ -29,6 +29,7 @@ from src.hparams import (
 )
 from src.method import create_learner
 from src.model import (
+    ConsoleMetricsCallback,
     HFModelExportCallback,
     JSONLMetricsCallback,
     ModelTuner,
@@ -188,6 +189,7 @@ class TrainingApp:
             ),
             RankZeroWandbFinishCallback(),
             JSONLMetricsCallback(trainer_args.metrics_jsonl),
+            ConsoleMetricsCallback(every_n_steps=trainer_args.log_every_n_steps),
         ]
         if loggers:
             callbacks.insert(0, LearningRateMonitor(logging_interval="step"))

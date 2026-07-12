@@ -142,3 +142,58 @@ class JSONLMetricsCallback(Callback):
         if self._handle is not None:
             self._handle.close()
             self._handle = None
+
+
+class ConsoleMetricsCallback(Callback):
+    DEFAULT_KEYS = (
+        "train/loss",
+        "train/opd_loss",
+        "train/grad_norm",
+        "train/teacher_mass",
+        "train/student_mass",
+        "train/topk_overlap_ratio",
+        "train/response_tokens_per_rank",
+        "train/param_update_max_abs",
+        "train/param_update_mean_abs",
+        "train/param_update_rel_mean",
+    )
+
+    def __init__(self, every_n_steps: int = 1, keys: tuple[str, ...] | None = None) -> None:
+        self.every_n_steps = max(1, int(every_n_steps))
+        self.keys = keys or self.DEFAULT_KEYS
+
+    @staticmethod
+    def format_value(value: Any) -> str:
+        if torch.is_tensor(value):
+            value = value.detach()
+            if value.numel() != 1:
+                return f"tensor{tuple(value.shape)}"
+            value = value.float().cpu().item()
+        if isinstance(value, float):
+            return f"{value:.6g}"
+        return str(value)
+
+    def on_train_batch_end(
+        self,
+        trainer: L.Trainer,
+        pl_module: L.LightningModule,
+        outputs: Any,
+        batch: Any,
+        batch_idx: int,
+    ) -> None:
+        if not trainer.is_global_zero:
+            return
+        step = int(trainer.global_step)
+        if step <= 0 or step % self.every_n_steps != 0:
+            return
+
+        parts = [
+            f"step={step}",
+            f"epoch={int(trainer.current_epoch)}",
+            f"batch={int(batch_idx)}",
+        ]
+        metrics = trainer.callback_metrics
+        for key in self.keys:
+            if key in metrics:
+                parts.append(f"{key}={self.format_value(metrics[key])}")
+        print("[metrics] " + " | ".join(parts), flush=True)
