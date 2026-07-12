@@ -40,6 +40,8 @@ class OPDLearner(RolloutMixin, BaseLearner):
         object.__setattr__(self, "_teacher_scorer", None)
         object.__setattr__(self, "_student_rollout", None)
         self._last_student_rollout_sync_step = -1
+        self._last_student_rollout_source_fingerprint: dict[str, Any] | None = None
+        self._last_student_rollout_remote_fingerprint: dict[str, Any] | None = None
         if self.method_args.rollout_backend == "vllm":
             if not student_model_path:
                 raise ValueError("method.rollout_backend='vllm' requires a student model path.")
@@ -295,12 +297,7 @@ class OPDLearner(RolloutMixin, BaseLearner):
             return None
         verify_name = self.method_args.rollout_student_server_verify_name
         if verify_name is None:
-            preferred = (
-                "model.language_model.embed_tokens.weight",
-                "lm_head.weight",
-            )
-            names = {name for name, _tensor in weights}
-            verify_name = next((name for name in preferred if name in names), weights[0][0])
+            verify_name = self._choose_sync_verify_weight_name(weights)
         tensor = next((value for name, value in weights if name == verify_name), None)
         if tensor is None:
             available = [name for name, _tensor in weights[:20]]
@@ -309,6 +306,7 @@ class OPDLearner(RolloutMixin, BaseLearner):
                 f"Available head: {available}"
             )
         sample = tensor.detach().flatten()[: int(self.method_args.rollout_student_server_verify_numel)].float().cpu()
+        sample_abs = sample.abs()
         return {
             "name": verify_name,
             "numel": int(sample.numel()),
@@ -317,9 +315,73 @@ class OPDLearner(RolloutMixin, BaseLearner):
             "device": str(tensor.device),
             "sum": float(sample.sum().item()),
             "mean": float(sample.mean().item()) if sample.numel() else 0.0,
-            "abs_sum": float(sample.abs().sum().item()),
-            "max_abs": float(sample.abs().max().item()) if sample.numel() else 0.0,
+            "abs_sum": float(sample_abs.sum().item()),
+            "sq_sum": float((sample * sample).sum().item()),
+            "max_abs": float(sample_abs.max().item()) if sample.numel() else 0.0,
         }
+
+    @staticmethod
+    def _choose_sync_verify_weight_name(weights: list[tuple[str, torch.Tensor]]) -> str:
+        names = [name for name, _tensor in weights]
+        name_set = set(names)
+        preferred = (
+            "model.language_model.layers.0.self_attn.q_proj.weight",
+            "model.language_model.layers.0.self_attn.o_proj.weight",
+            "model.language_model.layers.0.mlp.down_proj.weight",
+            "model.language_model.layers.1.self_attn.q_proj.weight",
+            "model.language_model.layers.1.mlp.down_proj.weight",
+        )
+        for name in preferred:
+            if name in name_set:
+                return name
+
+        suffixes = (
+            ".self_attn.q_proj.weight",
+            ".self_attn.o_proj.weight",
+            ".mlp.down_proj.weight",
+            ".mlp.gate_proj.weight",
+            ".mlp.up_proj.weight",
+        )
+        for name in names:
+            if ".layers." in name and name.endswith(suffixes):
+                return name
+
+        fallback = (
+            "lm_head.weight",
+            "model.language_model.embed_tokens.weight",
+        )
+        for name in fallback:
+            if name in name_set:
+                return name
+        return names[0]
+
+    @staticmethod
+    def _fingerprint_delta(
+        current: dict[str, Any],
+        previous: dict[str, Any] | None,
+    ) -> dict[str, Any] | None:
+        if previous is None:
+            return None
+        if current.get("name") != previous.get("name") and current.get("requested_name") != previous.get("requested_name"):
+            return {
+                "changed": None,
+                "reason": "different_weight_name",
+                "previous_name": previous.get("name"),
+                "current_name": current.get("name"),
+            }
+        deltas = {}
+        changed = False
+        for key in ("sum", "mean", "abs_sum", "sq_sum", "max_abs"):
+            current_value = float(current.get(key, 0.0))
+            previous_value = float(previous.get(key, 0.0))
+            abs_delta = abs(current_value - previous_value)
+            deltas[key] = {
+                "previous": previous_value,
+                "current": current_value,
+                "abs_delta": abs_delta,
+            }
+            changed = changed or abs_delta > 1.0e-12
+        return {"changed": changed, "deltas": deltas}
 
     def _verify_remote_sync_fingerprint(
         self,
@@ -335,8 +397,16 @@ class OPDLearner(RolloutMixin, BaseLearner):
             numel=int(source_fingerprint["numel"]),
         )
         remote_fingerprint = response.get("fingerprint") or {}
+        source_delta = self._fingerprint_delta(
+            source_fingerprint,
+            self._last_student_rollout_source_fingerprint,
+        )
+        remote_delta = self._fingerprint_delta(
+            remote_fingerprint,
+            self._last_student_rollout_remote_fingerprint,
+        )
         comparisons = {}
-        for key in ("sum", "mean", "abs_sum", "max_abs"):
+        for key in ("sum", "mean", "abs_sum", "sq_sum", "max_abs"):
             source_value = float(source_fingerprint.get(key, 0.0))
             remote_value = float(remote_fingerprint.get(key, 0.0))
             diff = abs(source_value - remote_value)
@@ -359,10 +429,14 @@ class OPDLearner(RolloutMixin, BaseLearner):
             f"remote_dtype={remote_fingerprint.get('dtype')}, "
             f"source_device={source_fingerprint.get('device')}, "
             f"remote_device={remote_fingerprint.get('device')}, "
+            f"source_delta_from_prev={source_delta}, "
+            f"remote_delta_from_prev={remote_delta}, "
             f"comparisons={comparisons}, "
             f"remote={remote_fingerprint}",
             flush=True,
         )
+        self._last_student_rollout_source_fingerprint = dict(source_fingerprint)
+        self._last_student_rollout_remote_fingerprint = dict(remote_fingerprint)
 
     def _remote_sync_dtype(self) -> torch.dtype | None:
         value = self.method_args.rollout_student_server_sync_dtype

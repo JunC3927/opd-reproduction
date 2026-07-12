@@ -195,6 +195,7 @@ def _fingerprint_weight_on_worker(model: Any, name: str, numel: int) -> str:
         )
 
     sample = tensor.detach().flatten()[: int(numel)].float().cpu()
+    sample_abs = sample.abs()
     return repr(
         {
             "ok": True,
@@ -208,8 +209,9 @@ def _fingerprint_weight_on_worker(model: Any, name: str, numel: int) -> str:
             "device": str(tensor.device),
             "sum": float(sample.sum().item()),
             "mean": float(sample.mean().item()) if sample.numel() else 0.0,
-            "abs_sum": float(sample.abs().sum().item()),
-            "max_abs": float(sample.abs().max().item()) if sample.numel() else 0.0,
+            "abs_sum": float(sample_abs.sum().item()),
+            "sq_sum": float((sample * sample).sum().item()),
+            "max_abs": float(sample_abs.max().item()) if sample.numel() else 0.0,
         }
     )
 
