@@ -211,6 +211,21 @@ class RolloutMixin:
             or getattr(config, "_clight_verl_monkey_patched", False)
         )
 
+    def _model_accepts_kwarg(self, name: str) -> bool:
+        for module in (self.model, getattr(self.model, "module", None)):
+            if module is None:
+                continue
+            for method_name in ("forward", "prepare_inputs_for_generation"):
+                method = getattr(module, method_name, None)
+                if method is None:
+                    continue
+                try:
+                    if name in inspect.signature(method).parameters:
+                        return True
+                except (TypeError, ValueError):
+                    continue
+        return False
+
     def prompt_model_kwargs(self, batch: dict[str, Any]) -> dict[str, Any]:
         kwargs = {
             key: value
@@ -228,7 +243,11 @@ class RolloutMixin:
 
         is_verl_patched = self._is_verl_monkey_patched()
 
-        if ("image_grid_thw" in kwargs or "video_grid_thw" in kwargs) and not is_verl_patched:
+        if (
+            ("image_grid_thw" in kwargs or "video_grid_thw" in kwargs)
+            and not is_verl_patched
+            and self._model_accepts_kwarg("mm_token_type_ids")
+        ):
             kwargs["mm_token_type_ids"] = self._build_mm_token_type_ids(
                 batch=batch,
                 input_ids=input_ids,
@@ -260,7 +279,11 @@ class RolloutMixin:
 
         is_verl_patched = self._is_verl_monkey_patched()
 
-        if ("image_grid_thw" in kwargs or "video_grid_thw" in kwargs) and not is_verl_patched:
+        if (
+            ("image_grid_thw" in kwargs or "video_grid_thw" in kwargs)
+            and not is_verl_patched
+            and self._model_accepts_kwarg("mm_token_type_ids")
+        ):
             kwargs["mm_token_type_ids"] = self._build_mm_token_type_ids(
                 batch=batch,
                 input_ids=input_ids,
