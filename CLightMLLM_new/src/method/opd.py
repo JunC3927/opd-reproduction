@@ -1,4 +1,5 @@
 import contextlib
+import gc
 import os
 import time
 from typing import Any
@@ -222,30 +223,36 @@ class OPDLearner(RolloutMixin, BaseLearner):
                 flush=True,
             )
             if rank == 0:
-                weights = self._student_model_weight_items()
-                weight_stats = describe_weight_items_for_ipc(weights, sync_dtype=sync_dtype)
-                print(
-                    "[student-vllm-sync rank=0] weight views ready: "
-                    f"step={current_step}, tensors={len(weights)}, sync_dtype={sync_dtype}, "
-                    f"bucket_size_mb={self.method_args.rollout_student_server_sync_bucket_size_mb}, "
-                    f"use_shm={self.method_args.rollout_student_server_sync_use_shm}, "
-                    f"weight_stats={weight_stats}",
-                    flush=True,
-                )
-                response = self.student_rollout.sync_weight_items_ipc(
-                    weights,
-                    bucket_size_mb=int(self.method_args.rollout_student_server_sync_bucket_size_mb),
-                    use_shm=bool(self.method_args.rollout_student_server_sync_use_shm),
-                    device=self.method_args.rollout_student_server_sync_device,
-                    sync_dtype=sync_dtype,
-                )
-                print(
-                    "[student-vllm-sync rank=0] remote weight sync done: "
-                    f"step={current_step}, seconds={time.time() - start:.3f}, "
-                    f"weight_version={response.get('weight_version')}, "
-                    f"summary={response.get('summary')}",
-                    flush=True,
-                )
+                weights: list[tuple[str, torch.Tensor]] | None = None
+                try:
+                    weights = self._student_model_weight_items()
+                    weight_stats = describe_weight_items_for_ipc(weights, sync_dtype=sync_dtype)
+                    print(
+                        "[student-vllm-sync rank=0] weight views ready: "
+                        f"step={current_step}, tensors={len(weights)}, sync_dtype={sync_dtype}, "
+                        f"bucket_size_mb={self.method_args.rollout_student_server_sync_bucket_size_mb}, "
+                        f"use_shm={self.method_args.rollout_student_server_sync_use_shm}, "
+                        f"weight_stats={weight_stats}",
+                        flush=True,
+                    )
+                    response = self.student_rollout.sync_weight_items_ipc(
+                        weights,
+                        bucket_size_mb=int(self.method_args.rollout_student_server_sync_bucket_size_mb),
+                        use_shm=bool(self.method_args.rollout_student_server_sync_use_shm),
+                        device=self.method_args.rollout_student_server_sync_device,
+                        sync_dtype=sync_dtype,
+                    )
+                    print(
+                        "[student-vllm-sync rank=0] remote weight sync done: "
+                        f"step={current_step}, seconds={time.time() - start:.3f}, "
+                        f"weight_version={response.get('weight_version')}, "
+                        f"summary={response.get('summary')}",
+                        flush=True,
+                    )
+                finally:
+                    if weights is not None:
+                        weights.clear()
+                    gc.collect()
             self._dist_barrier("inside-remote-student-sync", local_rank=local_rank)
         self._dist_barrier("post-remote-student-sync", local_rank=local_rank)
         if rank != 0:
