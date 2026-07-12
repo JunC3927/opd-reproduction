@@ -7,11 +7,11 @@ student vLLM rollout into OPD:
 
 1. initialize an NCCL training process group;
 2. load and FSDP-wrap the HF student on all training ranks;
-3. start one student vLLM engine on rank 0, preferably on a GPU outside the
+3. gather a full FSDP state dict with all ranks participating;
+4. destroy the training process group;
+5. start one student vLLM engine on rank 0, preferably on a GPU outside the
    training ranks;
-4. gather a full FSDP state dict with all ranks participating;
-5. send rank-0 weights to vLLM with the bucketed IPC path;
-6. barrier and clean up without c10d/NCCL timeout.
+6. send rank-0 weights to vLLM with the bucketed IPC path.
 """
 
 from __future__ import annotations
@@ -68,6 +68,22 @@ ARG_GROUPS = {
     "optimizer": OptimizerArguments,
     "trainer": TrainerArguments,
     "tuning": TuningArguments,
+}
+
+TORCHRUN_ENV_KEYS = {
+    "RANK",
+    "WORLD_SIZE",
+    "LOCAL_RANK",
+    "LOCAL_WORLD_SIZE",
+    "GROUP_RANK",
+    "GROUP_WORLD_SIZE",
+    "ROLE_RANK",
+    "ROLE_WORLD_SIZE",
+    "MASTER_ADDR",
+    "MASTER_PORT",
+    "TORCHELASTIC_RUN_ID",
+    "TORCHELASTIC_RESTART_COUNT",
+    "TORCHELASTIC_MAX_RESTARTS",
 }
 
 
@@ -150,6 +166,11 @@ def log(message: str, *, all_ranks: bool = False) -> None:
         print(f"[fsdp-vllm-probe rank={rank()}] {message}", flush=True)
 
 
+def scrub_torchrun_env_for_vllm() -> None:
+    for key in TORCHRUN_ENV_KEYS:
+        os.environ.pop(key, None)
+
+
 def init_distributed(timeout_sec: int) -> tuple[int, int, int, torch.device]:
     if not torch.cuda.is_available():
         raise RuntimeError("FSDP student vLLM sync probe requires CUDA.")
@@ -179,6 +200,25 @@ def cuda_memory_line(device: torch.device | str | int | None = None) -> str:
 def sync_cuda(device: torch.device, label: str) -> None:
     torch.cuda.synchronize(device)
     log(f"{label}: {cuda_memory_line(device)}", all_ranks=True)
+
+
+def distributed_barrier(label: str, *, local_rank: int | None = None) -> None:
+    if not (dist.is_available() and dist.is_initialized()):
+        return
+    log(f"{label} barrier start", all_ranks=True)
+    if local_rank is not None:
+        try:
+            dist.barrier(device_ids=[int(local_rank)])
+        except TypeError:
+            dist.barrier()
+    else:
+        dist.barrier()
+    log(f"{label} barrier done", all_ranks=True)
+
+
+def destroy_distributed() -> None:
+    if dist.is_available() and dist.is_initialized():
+        dist.destroy_process_group()
 
 
 def report_model_parameters(model: torch.nn.Module) -> None:
@@ -303,6 +343,7 @@ def main() -> None:
     rollout: VLLMStudentRollout | None = None
     fsdp_model: FSDP | None = None
     base_model: torch.nn.Module | None = None
+    dist_destroyed = False
 
     try:
         config_path = resolve_path(args.config)
@@ -349,7 +390,27 @@ def main() -> None:
         fsdp_model.eval()
         sync_cuda(device, "FSDP wrap done")
 
+        distributed_barrier("post-FSDP-wrap", local_rank=local_rank)
+        state_dict = collect_full_state_dict(fsdp_model)
+        distributed_barrier("post-full-state", local_rank=local_rank)
+
+        log("destroying training process group before vLLM init", all_ranks=True)
+        destroy_distributed()
+        dist_destroyed = True
+        log("training process group destroyed", all_ranks=True)
+
+        del fsdp_model
+        del base_model
+        fsdp_model = None
+        base_model = None
+        gc.collect()
+        torch.cuda.empty_cache()
+
         if not args.skip_vllm and is_rank0():
+            # Keep CUDA_VISIBLE_DEVICES for device remapping, but remove torchrun
+            # rendezvous variables so vLLM EngineCore cannot reconnect to the
+            # training TCPStore.
+            scrub_torchrun_env_for_vllm()
             log(
                 "vLLM init start: "
                 f"device={args.vllm_device}, dtype={args.vllm_dtype}, "
@@ -369,17 +430,6 @@ def main() -> None:
             )
             log(f"vLLM init done: seconds={time.time() - start:.3f}")
 
-        log("post-vLLM-init barrier start", all_ranks=True)
-        dist.barrier()
-        log("post-vLLM-init barrier done", all_ranks=True)
-
-        state_dict = collect_full_state_dict(fsdp_model)
-        dist.barrier()
-        log("post-full-state barrier done", all_ranks=True)
-
-        if not args.skip_vllm and is_rank0():
-            if rollout is None:
-                raise RuntimeError("Rank 0 rollout is unexpectedly None.")
             sync_dtype = None if args.sync_dtype.lower() == "none" else parse_torch_dtype(args.sync_dtype)
             weights = state_dict_to_weight_items(state_dict)
             log(
@@ -396,11 +446,8 @@ def main() -> None:
                 sync_dtype=sync_dtype,
             )
             log(f"weight sync done: seconds={time.time() - start:.3f}, summary={summary}")
-
-        log("post-sync barrier start", all_ranks=True)
-        dist.barrier()
-        log("post-sync barrier done", all_ranks=True)
-        if is_rank0():
+            log("RESULT=OK")
+        elif args.skip_vllm and is_rank0():
             log("RESULT=OK")
     finally:
         if is_rank0():
@@ -411,12 +458,8 @@ def main() -> None:
         gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
-        if dist.is_available() and dist.is_initialized():
-            try:
-                dist.barrier()
-            except Exception:
-                pass
-            dist.destroy_process_group()
+        if not dist_destroyed and dist.is_available() and dist.is_initialized():
+            destroy_distributed()
         if is_rank0():
             log("cleanup done")
 
