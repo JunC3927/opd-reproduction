@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import os
+import time
 from typing import Any
 
 import torch
@@ -19,6 +21,7 @@ class RemoteStudentRollout:
         self.host = host
         self.port = int(port)
         self.timeout = float(timeout)
+        self._rank = int(os.environ.get("RANK", os.environ.get("LOCAL_RANK", "0")))
 
     def ping(self) -> dict[str, Any]:
         response = rpc_call(self.host, self.port, {"op": "ping"}, self.timeout)
@@ -34,6 +37,12 @@ class RemoteStudentRollout:
         video_token_id: int | None,
         pad_token_id: int,
     ) -> tuple[torch.Tensor, int]:
+        started = time.time()
+        print(
+            f"[student-vllm-client rank={self._rank}] generate start: "
+            f"server={self.host}:{self.port}, batch={int(batch['prompt_input_ids'].shape[0])}",
+            flush=True,
+        )
         device = batch["prompt_input_ids"].device
         request = {
             "op": "generate",
@@ -45,7 +54,14 @@ class RemoteStudentRollout:
         }
         response = self._checked_response(rpc_call(self.host, self.port, request, self.timeout))
         sequences = response["sequences"].to(device=device, dtype=batch["prompt_input_ids"].dtype)
-        return sequences, int(response.get("weight_version", 0))
+        weight_version = int(response.get("weight_version", 0))
+        print(
+            f"[student-vllm-client rank={self._rank}] generate done: "
+            f"seconds={time.time() - started:.3f}, shape={tuple(sequences.shape)}, "
+            f"weight_version={weight_version}",
+            flush=True,
+        )
+        return sequences, weight_version
 
     def sync_state_dict(self, state_dict_path: str) -> dict[str, Any]:
         return self._checked_response(

@@ -62,7 +62,7 @@ class MethodArguments:
     name: Literal["base", "lwf", "grpo", "opd"] = "base"
     lwf_alpha: float = 1.0
     lwf_temperature: float = 2.0
-    rollout_backend: Literal["hf", "vllm", "reference"] = "hf"
+    rollout_backend: Literal["hf", "vllm", "vllm_student_server", "reference"] = "hf"
     rollout_max_new_tokens: int = 64
     rollout_num_generations: int = 1
     rollout_do_sample: bool = True
@@ -77,6 +77,9 @@ class MethodArguments:
     rollout_vllm_max_model_len: int | None = None
     rollout_vllm_enforce_eager: bool = False
     rollout_vllm_sync_after_optimizer_step: bool = True
+    rollout_student_server_host: str = "127.0.0.1"
+    rollout_student_server_port: int = 29588
+    rollout_student_server_timeout: float = 3600.0
     grpo_reward_type: Literal["reference_match", "length", "none"] = "reference_match"
     grpo_kl_coef: float = 0.0
     grpo_reference_model: bool = False
@@ -136,6 +139,10 @@ class MethodArguments:
             raise ValueError("method.rollout_vllm_gpu_memory_utilization must be in (0, 1].")
         if self.rollout_vllm_max_model_len is not None and self.rollout_vllm_max_model_len <= 0:
             raise ValueError("method.rollout_vllm_max_model_len must be positive when set.")
+        if self.rollout_student_server_port <= 0:
+            raise ValueError("method.rollout_student_server_port must be positive.")
+        if self.rollout_student_server_timeout <= 0:
+            raise ValueError("method.rollout_student_server_timeout must be positive.")
         if self.grpo_kl_coef < 0:
             raise ValueError("method.grpo_kl_coef must be non-negative.")
         if self.opd_alpha < 0:

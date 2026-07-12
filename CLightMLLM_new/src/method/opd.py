@@ -8,6 +8,7 @@ import torch.nn.functional as F
 from .base import BaseLearner
 from .rollout import RolloutMixin
 from .vllm_student import VLLMStudentRollout
+from .vllm_student_client import RemoteStudentRollout
 from .vllm_teacher import VLLMTeacherScorer
 from .vllm_teacher_client import RemoteTeacherScorer, RemoteVLLMTeacherScorer
 
@@ -52,6 +53,29 @@ class OPDLearner(RolloutMixin, BaseLearner):
                     visible_devices=self.method_args.rollout_vllm_visible_devices,
                 ),
             )
+        elif self.method_args.rollout_backend == "vllm_student_server":
+            if self.method_args.rollout_vllm_sync_after_optimizer_step:
+                raise ValueError(
+                    "method.rollout_backend='vllm_student_server' currently supports rollout smoke only. "
+                    "Set method.rollout_vllm_sync_after_optimizer_step=false until remote FSDP weight sync "
+                    "is enabled in the Lightning hook."
+                )
+            object.__setattr__(
+                self,
+                "_student_rollout",
+                RemoteStudentRollout(
+                    host=self.method_args.rollout_student_server_host,
+                    port=self.method_args.rollout_student_server_port,
+                    timeout=self.method_args.rollout_student_server_timeout,
+                ),
+            )
+            if is_rank_zero_process():
+                print(
+                    "[student-vllm-client] init done: "
+                    f"server={self.method_args.rollout_student_server_host}:"
+                    f"{self.method_args.rollout_student_server_port}",
+                    flush=True,
+                )
         if self.method_args.opd_teacher_backend == "vllm":
             if not self.method_args.opd_teacher_model_name_or_path:
                 raise ValueError("OPD vLLM teacher requires method.opd_teacher_model_name_or_path.")
@@ -111,7 +135,7 @@ class OPDLearner(RolloutMixin, BaseLearner):
         return getattr(self, "_teacher_scorer", None)
 
     @property
-    def student_rollout(self) -> VLLMStudentRollout | None:
+    def student_rollout(self) -> VLLMStudentRollout | RemoteStudentRollout | None:
         return getattr(self, "_student_rollout", None)
 
     def _is_auto_teacher_device(self) -> bool:
@@ -137,7 +161,14 @@ class OPDLearner(RolloutMixin, BaseLearner):
         current_step = int(getattr(self.trainer, "global_step", 0))
         if current_step <= self._last_student_rollout_sync_step:
             return
-        self.student_rollout.sync_from_hf_model(self.model)
+        sync_from_hf_model = getattr(self.student_rollout, "sync_from_hf_model", None)
+        if not callable(sync_from_hf_model):
+            raise RuntimeError(
+                f"rollout_backend={self.method_args.rollout_backend!r} does not support in-process "
+                "sync_from_hf_model. Disable rollout_vllm_sync_after_optimizer_step for smoke, or use "
+                "the remote FSDP IPC sync hook once it is enabled."
+            )
+        sync_from_hf_model(self.model)
         self._last_student_rollout_sync_step = current_step
 
     def on_save_checkpoint(self, checkpoint: dict) -> None:

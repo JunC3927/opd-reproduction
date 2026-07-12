@@ -339,13 +339,18 @@ class RolloutMixin:
         student_rollout = getattr(self, "student_rollout", None)
         if student_rollout is not None:
             config = getattr(self.model, "config", None)
-            return student_rollout.generate(
+            rollout_result = student_rollout.generate(
                 batch=batch,
                 method_args=self.method_args,
                 image_token_id=getattr(config, "image_token_id", None),
                 video_token_id=getattr(config, "video_token_id", None),
                 pad_token_id=self.tokenizer.pad_token_id,
             )
+            if isinstance(rollout_result, tuple):
+                sequences, weight_version = rollout_result
+                setattr(self, "_last_student_rollout_weight_version", int(weight_version))
+                return sequences
+            return rollout_result
 
         prompt_inputs = self.prompt_model_kwargs(batch)
         was_training = self.model.training
