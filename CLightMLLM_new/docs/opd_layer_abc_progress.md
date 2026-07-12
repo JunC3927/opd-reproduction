@@ -207,33 +207,30 @@ teacher-selected ids.
 
 The old VERL teacher ids/logprobs are used only as an alignment diagnostic.
 
-## Useful CLight tools
+## Current CLight tools
 
-Relevant tools in `CLightMLLM_new/tools`:
+The stable LayerC online OPD path now keeps only the tools needed for the
+current reproducible workflow:
 
 ```text
-inspect_verl_opd_trace.py
 replay_verl_opd_trace.py
 replay_verl_opd_trace_fsdp.py
 serve_vllm_teacher.py
-reconstruct_verl_teacher_requests_from_trace.py
-compare_teacher_request_to_final_prompt.py
-rescore_verl_trace_to_layerB.py
-inspect_teacher_topk_diff.py
+train_online_hf_opd_fsdp.py
 upload_replay_metrics_to_swanlab.py
 ```
 
-The main replay trainer for multi-GPU A100 is:
+For the current online LayerC runs, use:
 
 ```text
-tools/replay_verl_opd_trace_fsdp.py
+tools/train_online_hf_opd_fsdp.py
 ```
 
-The main Layer B trace writer is:
+The `replay_verl_opd_trace*.py` files are still kept because the online trainer
+reuses their optimizer, loss, dtype, FSDP, and trace helper functions.
 
-```text
-tools/rescore_verl_trace_to_layerB.py
-```
+Older one-off compare/rescore/probe scripts were removed after the trace and
+Geo3K parquet paths both reproduced the expected LayerC behavior.
 
 ## Stable A100 environment settings
 
@@ -345,4 +342,3 @@ Layer C-lite gives a clean next target without immediately adding online vLLM
 weight sync complexity.
 
 After Layer C-lite works and improves validation, move to Layer C-full.
-
