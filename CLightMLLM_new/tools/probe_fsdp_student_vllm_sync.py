@@ -10,8 +10,10 @@ student vLLM rollout into OPD:
 3. gather a full FSDP state dict with all ranks participating;
 4. optionally save the full state dict and stop, so vLLM can be launched from a
    separate non-torchrun process;
-5. otherwise destroy the training process group and try in-process rank-0 vLLM
-   sync. Prefer the two-step export+sync path when debugging c10d issues.
+5. optionally send the gathered state directly to a standalone student vLLM
+   server over bucketed IPC;
+6. otherwise destroy the training process group and try in-process rank-0 vLLM
+   sync. Prefer standalone-server modes when debugging c10d issues.
 """
 
 from __future__ import annotations
@@ -55,6 +57,7 @@ from src.hparams import (  # noqa: E402
     TuningArguments,
     parse_torch_dtype,
 )
+from src.method.vllm_student_client import RemoteStudentRollout  # noqa: E402
 from src.method.vllm_student import VLLMStudentRollout  # noqa: E402
 from src.model import ModelTuner, load_vision_language_model  # noqa: E402
 
@@ -112,6 +115,27 @@ def parse_args() -> argparse.Namespace:
         help="Path where rank 0 saves the gathered full state dict.",
     )
     parser.add_argument(
+        "--skip-save-state",
+        action="store_true",
+        help="Do not write the gathered FSDP full state dict to disk.",
+    )
+    parser.add_argument(
+        "--full-state-offload-to-cpu",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Use FSDP FullStateDictConfig(offload_to_cpu=...). Disable to keep rank0 full state on GPU.",
+    )
+    parser.add_argument(
+        "--sync-mode",
+        choices=("local_vllm", "remote_ipc", "export_only"),
+        default="local_vllm",
+        help=(
+            "local_vllm preserves the original in-process vLLM smoke path; "
+            "remote_ipc sends rank0 full-state weights to a standalone student vLLM server; "
+            "export_only only gathers/saves the full state."
+        ),
+    )
+    parser.add_argument(
         "--stop-after-export",
         action="store_true",
         help="Stop after saving the FSDP full state dict. Use the single-process sync script next.",
@@ -125,6 +149,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--ipc-bucket-size-mb", type=int, default=512)
     parser.add_argument("--ipc-use-shm", action="store_true")
     parser.add_argument("--ipc-timeout-sec", type=float, default=900.0)
+    parser.add_argument("--remote-student-host", default="127.0.0.1")
+    parser.add_argument("--remote-student-port", type=int, default=29588)
+    parser.add_argument(
+        "--remote-sync-device",
+        default=None,
+        help="Sender device for remote IPC. Leave unset to use current rank0 CUDA device or SHM CPU path.",
+    )
     parser.add_argument(
         "--sync-dtype",
         default="bfloat16",
@@ -326,9 +357,9 @@ def save_exported_state_dict(
     log(f"saved FSDP full_state_dict: seconds={time.time() - start:.3f}, size={size_gib:.2f}GiB")
 
 
-def collect_full_state_dict(fsdp_model: FSDP) -> dict[str, torch.Tensor]:
-    state_cfg = FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
-    log("FSDP full_state_dict start", all_ranks=True)
+def collect_full_state_dict(fsdp_model: FSDP, *, offload_to_cpu: bool) -> dict[str, torch.Tensor]:
+    state_cfg = FullStateDictConfig(offload_to_cpu=offload_to_cpu, rank0_only=True)
+    log(f"FSDP full_state_dict start: offload_to_cpu={offload_to_cpu}", all_ranks=True)
     start = time.time()
     with FSDP.state_dict_type(fsdp_model, StateDictType.FULL_STATE_DICT, state_cfg):
         state_dict = fsdp_model.state_dict()
@@ -336,13 +367,45 @@ def collect_full_state_dict(fsdp_model: FSDP) -> dict[str, torch.Tensor]:
     if is_rank0():
         tensor_count = sum(1 for value in state_dict.values() if torch.is_tensor(value))
         total_numel = sum(value.numel() for value in state_dict.values() if torch.is_tensor(value))
+        devices = sorted({str(value.device) for value in state_dict.values() if torch.is_tensor(value)})
         log(
             "FSDP full_state_dict done: "
-            f"seconds={elapsed:.3f}, tensors={tensor_count}, total_numel={total_numel:,}"
+            f"seconds={elapsed:.3f}, tensors={tensor_count}, total_numel={total_numel:,}, devices={devices}"
         )
     else:
         log(f"FSDP full_state_dict done: seconds={elapsed:.3f}, rank0_only_empty={len(state_dict) == 0}", all_ranks=True)
     return state_dict
+
+
+def sync_remote_student_from_state_dict(
+    state_dict: dict[str, torch.Tensor],
+    *,
+    host: str,
+    port: int,
+    timeout_sec: float,
+    bucket_size_mb: int,
+    sync_device: str | None,
+    sync_dtype: torch.dtype | None,
+) -> dict[str, Any]:
+    weights = state_dict_to_weight_items(state_dict)
+    log(
+        "remote student IPC sync start: "
+        f"server={host}:{port}, tensors={len(weights)}, sync_device={sync_device}, "
+        f"sync_dtype={sync_dtype}, bucket_size_mb={bucket_size_mb}"
+    )
+    client = RemoteStudentRollout(host=host, port=port, timeout=timeout_sec)
+    ping = client.ping()
+    log(f"remote student ping: {ping}")
+    start = time.time()
+    response = client.sync_weight_items_ipc(
+        weights,
+        bucket_size_mb=bucket_size_mb,
+        device=sync_device,
+        sync_dtype=sync_dtype,
+    )
+    response["client_total_sec"] = time.time() - start
+    log(f"remote student IPC sync done: seconds={response['client_total_sec']:.3f}, response={response}")
+    return response
 
 
 def try_cleanup_vllm(rollout: VLLMStudentRollout | None) -> None:
@@ -431,19 +494,38 @@ def main() -> None:
         sync_cuda(device, "FSDP wrap done")
 
         distributed_barrier("post-FSDP-wrap", local_rank=local_rank)
-        state_dict = collect_full_state_dict(fsdp_model)
-        save_exported_state_dict(
-            state_dict,
-            path=args.export_state_path,
-            config_path=config_path,
-            model_path=model_args.model_name_or_path,
-            ws=ws,
-        )
-        distributed_barrier("post-state-save", local_rank=local_rank)
+        state_dict = collect_full_state_dict(fsdp_model, offload_to_cpu=args.full_state_offload_to_cpu)
+        if args.skip_save_state:
+            log("skip_save_state requested; not writing FSDP full_state_dict to disk")
+        else:
+            save_exported_state_dict(
+                state_dict,
+                path=args.export_state_path,
+                config_path=config_path,
+                model_path=model_args.model_name_or_path,
+                ws=ws,
+            )
+        distributed_barrier("post-state-export", local_rank=local_rank)
         distributed_barrier("post-full-state", local_rank=local_rank)
 
-        if args.stop_after_export:
-            log("stop_after_export requested; skipping vLLM in torchrun process", all_ranks=True)
+        if args.sync_mode == "remote_ipc":
+            sync_dtype = None if args.sync_dtype.lower() == "none" else parse_torch_dtype(args.sync_dtype)
+            if is_rank0():
+                sync_remote_student_from_state_dict(
+                    state_dict,
+                    host=args.remote_student_host,
+                    port=args.remote_student_port,
+                    timeout_sec=args.ipc_timeout_sec,
+                    bucket_size_mb=args.ipc_bucket_size_mb,
+                    sync_device=args.remote_sync_device,
+                    sync_dtype=sync_dtype,
+                )
+                log("RESULT=OK")
+            distributed_barrier("post-remote-ipc-sync", local_rank=local_rank)
+            return
+
+        if args.stop_after_export or args.sync_mode == "export_only" or args.skip_vllm:
+            log("export-only requested; skipping vLLM in torchrun process", all_ranks=True)
             if is_rank0():
                 log("RESULT=OK")
             return
@@ -460,7 +542,7 @@ def main() -> None:
         gc.collect()
         torch.cuda.empty_cache()
 
-        if not args.skip_vllm and is_rank0():
+        if is_rank0():
             # Keep CUDA_VISIBLE_DEVICES for device remapping, but remove torchrun
             # rendezvous variables so vLLM EngineCore cannot reconnect to the
             # training TCPStore.
@@ -500,8 +582,6 @@ def main() -> None:
                 sync_dtype=sync_dtype,
             )
             log(f"weight sync done: seconds={time.time() - start:.3f}, summary={summary}")
-            log("RESULT=OK")
-        elif args.skip_vllm and is_rank0():
             log("RESULT=OK")
     finally:
         if is_rank0():
