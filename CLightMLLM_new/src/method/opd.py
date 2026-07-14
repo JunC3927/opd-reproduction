@@ -12,7 +12,7 @@ from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from ..hparams import parse_torch_dtype
 from .base import BaseLearner
 from .rollout import RolloutMixin
-from .vllm_student import RemoteStudentRollout, describe_weight_items_for_ipc
+from .vllm_student import RemoteStudentRollout
 from .vllm_teacher import RemoteTeacherScorer
 
 
@@ -164,13 +164,11 @@ class OPDLearner(RolloutMixin, BaseLearner):
                 weights: list[tuple[str, torch.Tensor]] | None = None
                 try:
                     weights = self._student_model_weight_items()
-                    weight_stats = describe_weight_items_for_ipc(weights, sync_dtype=sync_dtype)
                     print(
                         "[student-vllm-sync rank=0] weight views ready: "
                         f"step={current_step}, tensors={len(weights)}, sync_dtype={sync_dtype}, "
                         f"bucket_size_mb={self.method_args.rollout_student_server_sync_bucket_size_mb}, "
-                        f"use_shm={self.method_args.rollout_student_server_sync_use_shm}, "
-                        f"weight_stats={weight_stats}",
+                        f"use_shm={self.method_args.rollout_student_server_sync_use_shm}",
                         flush=True,
                     )
                     response = self.student_rollout.sync_weight_items_ipc(
