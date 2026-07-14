@@ -12,8 +12,6 @@ def create_learner(
     tokenizer=None,
     teacher_model=None,
     reference_model=None,
-    student_model_path=None,
-    torch_dtype="bfloat16",
 ):
     if method_args.name == "base":
         return BaseLearner(model=model, optimizer_args=optimizer_args)
@@ -40,8 +38,6 @@ def create_learner(
             tokenizer=tokenizer,
             method_args=method_args,
             teacher_model=teacher_model,
-            student_model_path=student_model_path,
-            torch_dtype=torch_dtype,
         )
     raise ValueError(f"Unsupported method: {method_args.name}")
 

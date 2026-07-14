@@ -141,11 +141,6 @@ class TrainingApp:
         teacher_model_path: str | None = None,
         reference_model_path: str | None = None,
     ) -> None:
-        if model_args.use_verl_monkey_patch and (teacher_model_path is not None or reference_model_path is not None):
-            raise ValueError(
-                "model.use_verl_monkey_patch modifies Qwen3-VL forward methods globally. "
-                "Use it with vLLM teacher/reference-free OPD, or disable HF teacher/reference models in this process."
-            )
         model, processor, tokenizer = load_vision_language_model(model_args, data_args.template)
         teacher_model = self.load_teacher_model(
             model_args,
@@ -173,8 +168,6 @@ class TrainingApp:
             tokenizer=tokenizer,
             teacher_model=teacher_model,
             reference_model=reference_model,
-            student_model_path=model_args.model_name_or_path,
-            torch_dtype=model_args.torch_dtype,
         )
         model_output_dir = os.path.join(trainer_args.save_dir, "model")
         trainer_kwargs = trainer_args.lightning_kwargs()
@@ -275,7 +268,6 @@ class TrainingApp:
             torch_dtype=torch_dtype or model_args.torch_dtype,
             gradient_checkpointing=False,
             use_cache=False,
-            use_verl_monkey_patch=False,
         )
         teacher_model, _, _ = load_vision_language_model(teacher_args, template_name)
         return teacher_model

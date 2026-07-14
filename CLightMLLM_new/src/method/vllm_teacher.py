@@ -1,6 +1,5 @@
 import inspect
 import os
-import warnings
 from typing import Any
 
 import torch
@@ -112,9 +111,6 @@ class RemoteTeacherScorer:
         return logps, ids, lengths
 
 
-RemoteVLLMTeacherScorer = RemoteTeacherScorer
-
-
 class VLLMTeacherScorer:
     def __init__(
         self,
@@ -139,7 +135,6 @@ class VLLMTeacherScorer:
         logprobs_mode: str | None = None,
         enforce_eager: bool = False,
         device: str | None = None,
-        visible_devices: str | None = None,
         local_files_only: bool = False,
         image_min_pixels: int | None = None,
         image_max_pixels: int | None = None,
@@ -149,30 +144,16 @@ class VLLMTeacherScorer:
         self.dedup_mm_tokens = bool(dedup_mm_tokens)
         device = resolve_cuda_device(device)
         self.device = device
-        self.visible_devices = visible_devices
 
         if local_files_only:
             os.environ.setdefault("HF_HUB_OFFLINE", "1")
             os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
 
         previous_device = None
-        if visible_devices is not None:
-            current_visible = os.environ.get("CUDA_VISIBLE_DEVICES")
-            if current_visible != visible_devices:
-                warnings.warn(
-                    "opd_vllm_visible_devices cannot safely change CUDA_VISIBLE_DEVICES after "
-                    "the Python process has started. Launch the script with "
-                    f"CUDA_VISIBLE_DEVICES={visible_devices} instead. The in-process vLLM "
-                    "teacher will use the devices visible to this process.",
-                    stacklevel=2,
-                )
-            if os.getenv("CLIGHT_OPD_VLLM_DEBUG") == "1" and is_rank_zero_process():
-                print(f"OPD requested vLLM CUDA_VISIBLE_DEVICES={visible_devices}")
-
         try:
             from vllm import LLM, SamplingParams
         except ImportError as exc:
-            raise ImportError("method.opd_teacher_backend='vllm' requires the vllm package.") from exc
+            raise ImportError("The teacher vLLM server requires the vllm package.") from exc
         self._tokens_prompt_cls = self._load_tokens_prompt_cls()
         self._sampling_params_cls = SamplingParams
 

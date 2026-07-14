@@ -12,8 +12,8 @@ from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from ..hparams import parse_torch_dtype
 from .base import BaseLearner
 from .rollout import RolloutMixin
-from .vllm_student import RemoteStudentRollout, VLLMStudentRollout, describe_weight_items_for_ipc
-from .vllm_teacher import RemoteTeacherScorer, RemoteVLLMTeacherScorer, VLLMTeacherScorer
+from .vllm_student import RemoteStudentRollout, describe_weight_items_for_ipc
+from .vllm_teacher import RemoteTeacherScorer
 
 
 def is_rank_zero_process() -> bool:
@@ -26,8 +26,6 @@ class OPDLearner(RolloutMixin, BaseLearner):
         *args,
         tokenizer: Any,
         method_args: Any,
-        student_model_path: str | None = None,
-        torch_dtype: str = "bfloat16",
         teacher_model: torch.nn.Module | None = None,
         **kwargs,
     ) -> None:
@@ -38,25 +36,7 @@ class OPDLearner(RolloutMixin, BaseLearner):
         object.__setattr__(self, "_teacher_scorer", None)
         object.__setattr__(self, "_student_rollout", None)
         self._last_student_rollout_sync_step = -1
-        if self.method_args.rollout_backend == "vllm":
-            if not student_model_path:
-                raise ValueError("method.rollout_backend='vllm' requires a student model path.")
-            object.__setattr__(
-                self,
-                "_student_rollout",
-                VLLMStudentRollout(
-                    model_path=student_model_path,
-                    tokenizer=tokenizer,
-                    torch_dtype=torch_dtype,
-                    tensor_parallel_size=self.method_args.rollout_vllm_tensor_parallel_size,
-                    gpu_memory_utilization=self.method_args.rollout_vllm_gpu_memory_utilization,
-                    max_model_len=self.method_args.rollout_vllm_max_model_len,
-                    enforce_eager=self.method_args.rollout_vllm_enforce_eager,
-                    device=self.method_args.rollout_vllm_device,
-                    visible_devices=self.method_args.rollout_vllm_visible_devices,
-                ),
-            )
-        elif self.method_args.rollout_backend == "vllm_student_server":
+        if self.method_args.rollout_backend == "vllm_student_server":
             if (
                 self.method_args.rollout_vllm_sync_after_optimizer_step
                 and self.method_args.rollout_student_server_sync_backend != "remote_ipc_summon"
@@ -82,39 +62,7 @@ class OPDLearner(RolloutMixin, BaseLearner):
                     f"{self.method_args.rollout_student_server_port}",
                     flush=True,
                 )
-        if self.method_args.opd_teacher_backend == "vllm":
-            if not self.method_args.opd_teacher_model_name_or_path:
-                raise ValueError("OPD vLLM teacher requires method.opd_teacher_model_name_or_path.")
-            object.__setattr__(
-                self,
-                "_teacher_scorer",
-                VLLMTeacherScorer(
-                    model_path=self.method_args.opd_teacher_model_name_or_path,
-                    topk=self.method_args.opd_topk,
-                    tensor_parallel_size=self.method_args.opd_vllm_tensor_parallel_size,
-                    gpu_memory_utilization=self.method_args.opd_vllm_gpu_memory_utilization,
-                    max_model_len=self.method_args.opd_vllm_max_model_len,
-                    max_logprobs=self.method_args.opd_vllm_max_logprobs,
-                    max_num_batched_tokens=self.method_args.opd_vllm_max_num_batched_tokens,
-                    max_num_seqs=self.method_args.opd_vllm_max_num_seqs,
-                    load_format=self.method_args.opd_vllm_load_format,
-                    distributed_executor_backend=self.method_args.opd_vllm_distributed_executor_backend,
-                    enable_chunked_prefill=self.method_args.opd_vllm_enable_chunked_prefill,
-                    enable_prefix_caching=self.method_args.opd_vllm_enable_prefix_caching,
-                    disable_log_stats=self.method_args.opd_vllm_disable_log_stats,
-                    seed=self.method_args.opd_vllm_seed,
-                    limit_mm_per_prompt=(
-                        {"image": self.method_args.opd_vllm_limit_images, "video": 0}
-                        if self.method_args.opd_vllm_limit_images is not None
-                        else None
-                    ),
-                    logprobs_mode=self.method_args.opd_vllm_logprobs_mode,
-                    enforce_eager=self.method_args.opd_vllm_enforce_eager,
-                    device=self.method_args.opd_vllm_device,
-                    visible_devices=self.method_args.opd_vllm_visible_devices,
-                ),
-            )
-        elif self.method_args.opd_teacher_backend in {"vllm_server", "hf_server"}:
+        if self.method_args.opd_teacher_backend in {"vllm_server", "hf_server"}:
             object.__setattr__(
                 self,
                 "_teacher_scorer",
@@ -137,11 +85,11 @@ class OPDLearner(RolloutMixin, BaseLearner):
         return getattr(self, "_teacher_model", None)
 
     @property
-    def teacher_scorer(self) -> VLLMTeacherScorer | RemoteTeacherScorer | RemoteVLLMTeacherScorer | None:
+    def teacher_scorer(self) -> RemoteTeacherScorer | None:
         return getattr(self, "_teacher_scorer", None)
 
     @property
-    def student_rollout(self) -> VLLMStudentRollout | RemoteStudentRollout | None:
+    def student_rollout(self) -> RemoteStudentRollout | None:
         return getattr(self, "_student_rollout", None)
 
     def _is_auto_teacher_device(self) -> bool:
@@ -171,15 +119,7 @@ class OPDLearner(RolloutMixin, BaseLearner):
             self._sync_remote_student_rollout(current_step=current_step)
             self._last_student_rollout_sync_step = current_step
             return
-        sync_from_hf_model = getattr(self.student_rollout, "sync_from_hf_model", None)
-        if not callable(sync_from_hf_model):
-            raise RuntimeError(
-                f"rollout_backend={self.method_args.rollout_backend!r} does not support in-process "
-                "sync_from_hf_model. Disable rollout_vllm_sync_after_optimizer_step for smoke, or use "
-                "the remote FSDP IPC sync hook once it is enabled."
-            )
-        sync_from_hf_model(self.model)
-        self._last_student_rollout_sync_step = current_step
+        raise RuntimeError("Student vLLM weight sync requires rollout_backend='vllm_student_server'.")
 
     def _sync_remote_student_rollout(self, *, current_step: int) -> None:
         if self.method_args.rollout_student_server_sync_backend != "remote_ipc_summon":
@@ -378,7 +318,7 @@ class OPDLearner(RolloutMixin, BaseLearner):
 
     def compute_loss(self, batch: dict[str, Any]) -> torch.Tensor:
         if self.teacher_model is None and self.teacher_scorer is None:
-            raise ValueError("OPD requires an HF teacher_model or method.opd_teacher_backend='vllm'.")
+            raise ValueError("OPD requires an HF teacher_model or method.opd_teacher_backend='vllm_server'/'hf_server'.")
         if self.method_args.opd_loss_type != "forward_kl_topk":
             raise NotImplementedError(
                 "This OPD learner currently implements method.opd_loss_type='forward_kl_topk' only."
@@ -395,20 +335,13 @@ class OPDLearner(RolloutMixin, BaseLearner):
 
         for _ in range(self.method_args.rollout_num_generations):
             sequences = self.generate_rollout(batch)
-            if self.method_args.rollout_backend == "reference":
-                attention_mask = batch["attention_mask"]
-                labels = batch.get("labels")
-                if labels is None:
-                    raise ValueError("method.rollout_backend='reference' requires batch labels.")
-                response_mask = labels[:, 1:].ne(-100) & attention_mask[:, 1:].bool()
-            else:
-                completion_mask = self.completion_mask(sequences, prompt_width)
-                attention_mask = self.sequence_attention_mask(batch, sequences, completion_mask)
-                response_mask = self.shift_completion_mask(
-                    token_values=sequences[:, 1:],
-                    completion_mask=completion_mask,
-                    prompt_width=prompt_width,
-                )
+            completion_mask = self.completion_mask(sequences, prompt_width)
+            attention_mask = self.sequence_attention_mask(batch, sequences, completion_mask)
+            response_mask = self.shift_completion_mask(
+                token_values=sequences[:, 1:],
+                completion_mask=completion_mask,
+                prompt_width=prompt_width,
+            )
 
             if response_mask.sum() == 0:
                 continue

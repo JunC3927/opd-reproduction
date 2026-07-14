@@ -1,6 +1,4 @@
 from dataclasses import dataclass
-import os
-import sys
 from typing import Any
 
 import torch
@@ -15,46 +13,6 @@ AUTO_MODEL_CLASSES = (
     "AutoModelForVision2Seq",
     "AutoModelForCausalLM",
 )
-
-
-def is_rank_zero_process() -> bool:
-    return int(os.environ.get("RANK", os.environ.get("LOCAL_RANK", "0"))) == 0
-
-
-def apply_verl_monkey_patch_if_requested(model: torch.nn.Module, model_args: ModelArguments) -> None:
-    if not model_args.use_verl_monkey_patch:
-        return
-
-    if model_args.verl_repo_path and model_args.verl_repo_path not in sys.path:
-        sys.path.insert(0, model_args.verl_repo_path)
-
-    try:
-        from verl.models.transformers.monkey_patch import apply_monkey_patch
-    except Exception as exc:
-        raise RuntimeError(
-            "model.use_verl_monkey_patch=true requires verl to be importable. "
-            "Set model.verl_repo_path or export PYTHONPATH=/path/to/verl_new:$PYTHONPATH."
-        ) from exc
-
-    apply_monkey_patch(
-        model=model,
-        ulysses_sp_size=model_args.verl_monkey_patch_ulysses_sp_size,
-        use_remove_padding=model_args.verl_monkey_patch_use_remove_padding,
-        use_fused_kernels=model_args.verl_monkey_patch_use_fused_kernels,
-        fused_kernels_backend=model_args.verl_monkey_patch_fused_kernels_backend,
-    )
-
-    setattr(model, "_clight_verl_monkey_patched", True)
-    if getattr(model, "config", None) is not None:
-        setattr(model.config, "_clight_verl_monkey_patched", True)
-    if is_rank_zero_process():
-        print(
-            "CLight applied verl monkey patch: "
-            f"use_remove_padding={model_args.verl_monkey_patch_use_remove_padding}, "
-            f"ulysses_sp_size={model_args.verl_monkey_patch_ulysses_sp_size}, "
-            f"use_fused_kernels={model_args.verl_monkey_patch_use_fused_kernels}, "
-            f"fused_kernels_backend={model_args.verl_monkey_patch_fused_kernels_backend}"
-        )
 
 
 def load_processor_and_tokenizer(model_args: ModelArguments):
@@ -102,8 +60,6 @@ def load_vision_language_model(model_args: ModelArguments, template_name: str):
                 errors.append(f"{class_name}: {exc}")
     else:
         raise RuntimeError("Could not load a vision-language model. Tried:\n" + "\n".join(errors))
-
-    apply_verl_monkey_patch_if_requested(model, model_args)
 
     if model_args.gradient_checkpointing:
         try:

@@ -1,11 +1,9 @@
 import os
 import asyncio
-from contextlib import contextmanager
 import functools
 import sys
 import threading
 import time
-import warnings
 from pathlib import Path
 from typing import Any
 
@@ -33,59 +31,6 @@ def resolve_cuda_device(device: str | None) -> str | None:
             return None
         return f"cuda:{int(os.environ.get('LOCAL_RANK', '0'))}"
     return device
-
-
-def resolve_visible_device_for_child(device: str | None) -> str | None:
-    if device is None or not str(device).startswith("cuda"):
-        return None
-    index = torch.device(device).index
-    if index is None:
-        return None
-    visible = os.environ.get("CUDA_VISIBLE_DEVICES")
-    if not visible:
-        return str(index)
-    entries = [entry.strip() for entry in visible.split(",") if entry.strip()]
-    if index >= len(entries):
-        raise ValueError(
-            f"Requested student vLLM device {device}, but CUDA_VISIBLE_DEVICES={visible!r} "
-            f"only exposes {len(entries)} device(s)."
-        )
-    return entries[index]
-
-
-@contextmanager
-def isolated_vllm_distributed_env(cuda_visible_devices: str | None = None):
-    """Prevent vLLM worker subprocesses from inheriting torchrun ranks."""
-    keys = [
-        "RANK",
-        "WORLD_SIZE",
-        "LOCAL_RANK",
-        "LOCAL_WORLD_SIZE",
-        "GROUP_RANK",
-        "GROUP_WORLD_SIZE",
-        "ROLE_RANK",
-        "ROLE_WORLD_SIZE",
-        "MASTER_ADDR",
-        "MASTER_PORT",
-        "TORCHELASTIC_RUN_ID",
-        "TORCHELASTIC_RESTART_COUNT",
-        "TORCHELASTIC_MAX_RESTARTS",
-    ]
-    if cuda_visible_devices is not None:
-        keys.append("CUDA_VISIBLE_DEVICES")
-    saved = {key: os.environ.get(key) for key in keys}
-    for key in keys:
-        os.environ.pop(key, None)
-    if cuda_visible_devices is not None:
-        os.environ["CUDA_VISIBLE_DEVICES"] = cuda_visible_devices
-    try:
-        yield
-    finally:
-        for key, value in saved.items():
-            if value is None:
-                os.environ.pop(key, None)
-            else:
-                os.environ[key] = value
 
 
 def _load_weights_into_model(model: Any, weights: list[tuple[str, torch.Tensor]]) -> dict[str, Any]:
@@ -470,32 +415,17 @@ class VLLMStudentRollout:
         seed: int | None = None,
         enforce_eager: bool = False,
         device: str | None = None,
-        visible_devices: str | None = None,
         limit_mm_per_prompt: dict[str, int] | None = None,
     ) -> None:
         self.tokenizer = tokenizer
         device = resolve_cuda_device(device)
         self.device = device
-        self.visible_devices = visible_devices
-        self.vllm_worker_visible_device = resolve_visible_device_for_child(device)
-
-        if visible_devices is not None:
-            current_visible = os.environ.get("CUDA_VISIBLE_DEVICES")
-            if current_visible != visible_devices:
-                warnings.warn(
-                    "rollout_vllm_visible_devices cannot safely change CUDA_VISIBLE_DEVICES after "
-                    "the Python process has started. Launch the script with "
-                    f"CUDA_VISIBLE_DEVICES={visible_devices} instead.",
-                    stacklevel=2,
-                )
-            if os.getenv("CLIGHT_OPD_VLLM_DEBUG") == "1" and is_rank_zero_process():
-                print(f"OPD requested student rollout CUDA_VISIBLE_DEVICES={visible_devices}")
 
         try:
             os.environ.setdefault("VLLM_ALLOW_INSECURE_SERIALIZATION", "1")
             from vllm import LLM, SamplingParams
         except ImportError as exc:
-            raise ImportError("method.rollout_backend='vllm' requires the vllm package.") from exc
+            raise ImportError("The student vLLM server requires the vllm package.") from exc
 
         self._sampling_params_cls = SamplingParams
         self._tokens_prompt_cls = self._load_tokens_prompt_cls()
@@ -548,8 +478,7 @@ class VLLMStudentRollout:
             llm_kwargs["limit_mm_per_prompt"] = limit_mm_per_prompt
 
         try:
-            with isolated_vllm_distributed_env(cuda_visible_devices=self.vllm_worker_visible_device):
-                self.llm = LLM(**llm_kwargs)
+            self.llm = LLM(**llm_kwargs)
         finally:
             if previous_device is not None:
                 torch.cuda.set_device(previous_device)
@@ -685,25 +614,6 @@ class VLLMStudentRollout:
 
         return torch.cat([prompt_ids, completion_tensor], dim=1)
 
-    def sync_from_hf_model(self, model: torch.nn.Module) -> None:
-        if torch.distributed.is_initialized() and torch.distributed.get_world_size() > 1:
-            raise NotImplementedError(
-                "Student vLLM weight sync currently supports a single training process only. "
-                "For true FSDP multi-rank sync, CLight needs a verl-style rollout worker and "
-                "distributed weight transfer path."
-            )
-
-        vllm_model = self._find_vllm_model_with_load_weights()
-        weights = []
-        for name, tensor in model.state_dict().items():
-            if not torch.is_tensor(tensor):
-                continue
-            weights.append((name, tensor.detach().cpu()))
-        vllm_model.load_weights(weights)
-
-        if os.getenv("CLIGHT_OPD_VLLM_DEBUG") == "1" and is_rank_zero_process():
-            print(f"OPD student vLLM synced {len(weights)} tensors from HF student.")
-
     def _resolve_apply_model_for_ipc(self) -> tuple[Any, str]:
         apply_model = getattr(self.llm, "apply_model", None)
         owner_name = "llm"
@@ -748,25 +658,3 @@ class VLLMStudentRollout:
             "use_shm": bool(use_shm),
             "started_at": time.time(),
         }
-
-    def _find_vllm_model_with_load_weights(self) -> Any:
-        candidates = [
-            "llm_engine.model_executor.driver_worker.model_runner.model",
-            "llm_engine.model_executor.driver_worker.worker.model_runner.model",
-            "llm_engine.engine_core.engine_core.model_executor.driver_worker.model_runner.model",
-            "engine_core.engine_core.model_executor.driver_worker.model_runner.model",
-        ]
-        for path in candidates:
-            current: Any = self.llm
-            for attr in path.split("."):
-                current = getattr(current, attr, None)
-                if current is None:
-                    break
-            if current is not None and hasattr(current, "load_weights"):
-                return current
-
-        raise RuntimeError(
-            "Could not find a vLLM model object with load_weights(). "
-            "This vLLM version may hide the in-process model runner; use HF rollout "
-            "or add a version-specific vLLM weight sync adapter."
-        )

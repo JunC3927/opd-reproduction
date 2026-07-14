@@ -62,7 +62,7 @@ class MethodArguments:
     name: Literal["base", "lwf", "grpo", "opd"] = "base"
     lwf_alpha: float = 1.0
     lwf_temperature: float = 2.0
-    rollout_backend: Literal["hf", "vllm", "vllm_student_server", "reference"] = "hf"
+    rollout_backend: Literal["hf", "vllm_student_server"] = "hf"
     rollout_max_new_tokens: int = 64
     rollout_num_generations: int = 1
     rollout_do_sample: bool = True
@@ -70,12 +70,6 @@ class MethodArguments:
     rollout_top_p: float = 0.9
     rollout_top_k: int | None = None
     rollout_use_cache: bool = True
-    rollout_vllm_device: str | None = None
-    rollout_vllm_visible_devices: str | None = None
-    rollout_vllm_tensor_parallel_size: int = 1
-    rollout_vllm_gpu_memory_utilization: float = 0.8
-    rollout_vllm_max_model_len: int | None = None
-    rollout_vllm_enforce_eager: bool = False
     rollout_vllm_sync_after_optimizer_step: bool = True
     rollout_student_server_host: str = "127.0.0.1"
     rollout_student_server_port: int = 29588
@@ -91,29 +85,12 @@ class MethodArguments:
     grpo_kl_coef: float = 0.0
     grpo_reference_model: bool = False
     opd_teacher_model_name_or_path: str | None = None
-    opd_teacher_backend: Literal["hf", "vllm", "vllm_server", "hf_server"] = "hf"
+    opd_teacher_backend: Literal["hf", "vllm_server", "hf_server"] = "hf"
     opd_teacher_device: str | None = None
     opd_teacher_torch_dtype: str | None = None
     opd_teacher_server_host: str = "127.0.0.1"
     opd_teacher_server_port: int = 29577
     opd_teacher_server_timeout: float = 600.0
-    opd_vllm_device: str | None = None
-    opd_vllm_visible_devices: str | None = None
-    opd_vllm_tensor_parallel_size: int = 1
-    opd_vllm_gpu_memory_utilization: float = 0.8
-    opd_vllm_max_model_len: int | None = None
-    opd_vllm_max_logprobs: int | None = None
-    opd_vllm_max_num_batched_tokens: int | None = None
-    opd_vllm_max_num_seqs: int | None = None
-    opd_vllm_load_format: str | None = None
-    opd_vllm_distributed_executor_backend: str | None = None
-    opd_vllm_enable_chunked_prefill: bool | None = None
-    opd_vllm_enable_prefix_caching: bool | None = None
-    opd_vllm_disable_log_stats: bool | None = None
-    opd_vllm_seed: int | None = None
-    opd_vllm_limit_images: int | None = None
-    opd_vllm_logprobs_mode: str | None = None
-    opd_vllm_enforce_eager: bool = False
     opd_alpha: float = 1.0
     opd_temperature: float = 1.0
     opd_loss_type: Literal["kl", "direct","forward_kl_topk"] = "kl"
@@ -140,12 +117,6 @@ class MethodArguments:
             raise ValueError("method.rollout_top_p must be in (0, 1].")
         if self.rollout_top_k is not None and self.rollout_top_k <= 0:
             raise ValueError("method.rollout_top_k must be positive when set.")
-        if self.rollout_vllm_tensor_parallel_size <= 0:
-            raise ValueError("method.rollout_vllm_tensor_parallel_size must be positive.")
-        if not 0 < self.rollout_vllm_gpu_memory_utilization <= 1:
-            raise ValueError("method.rollout_vllm_gpu_memory_utilization must be in (0, 1].")
-        if self.rollout_vllm_max_model_len is not None and self.rollout_vllm_max_model_len <= 0:
-            raise ValueError("method.rollout_vllm_max_model_len must be positive when set.")
         if self.rollout_student_server_port <= 0:
             raise ValueError("method.rollout_student_server_port must be positive.")
         if self.rollout_student_server_timeout <= 0:
@@ -166,20 +137,6 @@ class MethodArguments:
             raise ValueError("method.opd_sft_coef must be non-negative.")
         if self.opd_topk <= 0:
             raise ValueError("method.opd_topk must be positive.")
-        if self.opd_vllm_tensor_parallel_size <= 0:
-            raise ValueError("method.opd_vllm_tensor_parallel_size must be positive.")
-        if not 0 < self.opd_vllm_gpu_memory_utilization <= 1:
-            raise ValueError("method.opd_vllm_gpu_memory_utilization must be in (0, 1].")
-        if self.opd_vllm_max_model_len is not None and self.opd_vllm_max_model_len <= 0:
-            raise ValueError("method.opd_vllm_max_model_len must be positive when set.")
-        if self.opd_vllm_max_logprobs is not None and self.opd_vllm_max_logprobs < self.opd_topk:
-            raise ValueError("method.opd_vllm_max_logprobs must be >= method.opd_topk when set.")
-        if self.opd_vllm_max_num_batched_tokens is not None and self.opd_vllm_max_num_batched_tokens <= 0:
-            raise ValueError("method.opd_vllm_max_num_batched_tokens must be positive when set.")
-        if self.opd_vllm_max_num_seqs is not None and self.opd_vllm_max_num_seqs <= 0:
-            raise ValueError("method.opd_vllm_max_num_seqs must be positive when set.")
-        if self.opd_vllm_limit_images is not None and self.opd_vllm_limit_images < 0:
-            raise ValueError("method.opd_vllm_limit_images must be non-negative when set.")
         if self.opd_loss_max_clamp is not None and self.opd_loss_max_clamp <= 0:
             raise ValueError("method.opd_loss_max_clamp must be positive when set.")
         if self.opd_teacher_server_port <= 0:
@@ -241,12 +198,6 @@ class ModelArguments:
     local_files_only: bool = False
     image_min_pixels: int | None = None
     image_max_pixels: int | None = None
-    use_verl_monkey_patch: bool = False
-    verl_repo_path: str | None = None
-    verl_monkey_patch_use_remove_padding: bool = False
-    verl_monkey_patch_ulysses_sp_size: int = 1
-    verl_monkey_patch_use_fused_kernels: bool = False
-    verl_monkey_patch_fused_kernels_backend: str | None = None
 
 
 @dataclass

@@ -1,4 +1,3 @@
-import os
 import inspect
 import contextlib
 from typing import Any
@@ -24,7 +23,6 @@ class RolloutMixin:
         "rope_deltas",
         "token_type_ids",
         "mm_token_type_ids",
-        "vllm_images",
     }
     def prompt_width(self, batch: dict[str, Any]) -> int:
         """
@@ -117,99 +115,6 @@ class RolloutMixin:
 
         return mm_token_type_ids
 
-    def _normalise_position_ids(self, position_ids: torch.Tensor) -> torch.Tensor:
-        if position_ids.dim() == 3:
-            if position_ids.shape[0] in (3, 4):
-                return position_ids
-            if position_ids.shape[1] in (3, 4):
-                return position_ids.transpose(0, 1)
-        if position_ids.dim() == 2:
-            return position_ids.unsqueeze(0)
-        raise ValueError(f"Unsupported position_ids shape for verl monkey patch: {tuple(position_ids.shape)}")
-
-    def _text_position_ids(self, attention_mask: torch.Tensor) -> torch.Tensor:
-        valid_mask = attention_mask.bool()
-        text_position_ids = torch.ones_like(attention_mask, dtype=torch.long)
-        for row in range(attention_mask.shape[0]):
-            valid_count = int(valid_mask[row].sum().item())
-            if valid_count > 0:
-                text_position_ids[row, valid_mask[row]] = torch.arange(
-                    valid_count,
-                    dtype=torch.long,
-                    device=attention_mask.device,
-                )
-        return text_position_ids
-
-    def _compute_vision_position_ids(
-        self,
-        batch: dict[str, Any],
-        input_ids: torch.Tensor,
-        attention_mask: torch.Tensor,
-    ) -> torch.Tensor | None:
-        target_model = getattr(self.model, "model", None)
-        compute_3d_position_ids = getattr(target_model, "compute_3d_position_ids", None)
-        if compute_3d_position_ids is None:
-            return None
-
-        kwargs = {
-            "input_ids": input_ids,
-            "attention_mask": attention_mask,
-            "image_grid_thw": batch.get("image_grid_thw"),
-            "video_grid_thw": batch.get("video_grid_thw"),
-            "mm_token_type_ids": self._build_mm_token_type_ids(batch, input_ids),
-        }
-        params = inspect.signature(compute_3d_position_ids).parameters
-        if "inputs_embeds" in params:
-            kwargs["inputs_embeds"] = self.model.get_input_embeddings()(input_ids)
-        output = compute_3d_position_ids(**{key: value for key, value in kwargs.items() if key in params})
-        if isinstance(output, tuple):
-            output = output[0]
-        if not torch.is_tensor(output):
-            return None
-        return self._normalise_position_ids(output.to(device=input_ids.device, dtype=torch.long))
-
-    def _build_verl_position_ids(
-        self,
-        batch: dict[str, Any],
-        input_ids: torch.Tensor,
-        attention_mask: torch.Tensor,
-    ) -> torch.Tensor | None:
-        source = self._compute_vision_position_ids(batch, input_ids, attention_mask)
-        if source is None:
-            source = batch.get("position_ids")
-            if source is None:
-                return None
-            source = self._normalise_position_ids(source.to(device=input_ids.device, dtype=torch.long))
-            seq_len = input_ids.shape[1]
-            if source.shape[-1] < seq_len:
-                pad_len = seq_len - source.shape[-1]
-                last = source[..., -1:]
-                delta = torch.arange(1, pad_len + 1, dtype=source.dtype, device=source.device)
-                view_shape = (1,) * (source.dim() - 1) + (pad_len,)
-                extension = last + delta.reshape(view_shape)
-                source = torch.cat([source, extension.expand(*source.shape[:-1], pad_len)], dim=-1)
-            source = source[..., :seq_len]
-
-        if source.shape[-1] != input_ids.shape[1]:
-            raise ValueError(
-                "verl position_ids length mismatch: "
-                f"position_ids={tuple(source.shape)}, input_ids={tuple(input_ids.shape)}"
-            )
-
-        if source.shape[0] == 4:
-            return source
-        if source.shape[0] == 3:
-            text_position_ids = self._text_position_ids(attention_mask).unsqueeze(0)
-            return torch.cat([text_position_ids, source], dim=0)
-        return source
-
-    def _is_verl_monkey_patched(self) -> bool:
-        config = getattr(self.model, "config", None)
-        return bool(
-            getattr(self.model, "_clight_verl_monkey_patched", False)
-            or getattr(config, "_clight_verl_monkey_patched", False)
-        )
-
     def _model_accepts_kwarg(self, name: str) -> bool:
         for module in (self.model, getattr(self.model, "module", None)):
             if module is None:
@@ -240,11 +145,8 @@ class RolloutMixin:
         kwargs["input_ids"] = input_ids
         kwargs["attention_mask"] = attention_mask
 
-        is_verl_patched = self._is_verl_monkey_patched()
-
         if (
             ("image_grid_thw" in kwargs or "video_grid_thw" in kwargs)
-            and not is_verl_patched
             and self._model_accepts_kwarg("mm_token_type_ids")
         ):
             kwargs["mm_token_type_ids"] = self._build_mm_token_type_ids(
@@ -252,11 +154,6 @@ class RolloutMixin:
                 input_ids=input_ids,
                 prompt_width=input_ids.shape[1],
             )
-
-        if is_verl_patched:
-            position_ids = self._build_verl_position_ids(batch, input_ids, attention_mask)
-            if position_ids is not None:
-                kwargs["position_ids"] = position_ids
 
         return kwargs
 
@@ -276,11 +173,8 @@ class RolloutMixin:
         kwargs["attention_mask"] = attention_mask
         kwargs["use_cache"] = False
 
-        is_verl_patched = self._is_verl_monkey_patched()
-
         if (
             ("image_grid_thw" in kwargs or "video_grid_thw" in kwargs)
-            and not is_verl_patched
             and self._model_accepts_kwarg("mm_token_type_ids")
         ):
             kwargs["mm_token_type_ids"] = self._build_mm_token_type_ids(
@@ -288,34 +182,6 @@ class RolloutMixin:
                 input_ids=input_ids,
                 prompt_width=self.prompt_width(batch),
             )
-
-        if is_verl_patched:
-            position_ids = self._build_verl_position_ids(batch, input_ids, attention_mask)
-            if position_ids is not None:
-                kwargs["position_ids"] = position_ids
-        
-        if torch.distributed.is_initialized():
-            rank = torch.distributed.get_rank()
-        else:
-            rank = 0
-
-        if os.getenv("CLIGHT_OPD_MM_DEBUG") == "1" and rank == 0 and not hasattr(self, "_printed_mm_debug"):
-            print("========== MM DEBUG ==========")
-            print("batch keys:", list(batch.keys()))
-            print("kwargs keys:", list(kwargs.keys()))
-
-            if "mm_token_type_ids" in kwargs:
-                print("input_ids shape:", kwargs["input_ids"].shape)
-                print("mm_token_type_ids shape:", kwargs["mm_token_type_ids"].shape)
-                print(
-                    "unique mm_token_type_ids:",
-                    torch.unique(kwargs["mm_token_type_ids"]).detach().cpu(),
-                )
-
-            print("image_token_id:", self._get_config_attr("image_token_id", None) if hasattr(self, "_get_config_attr") else getattr(getattr(self.model, "config", None), "image_token_id", None))
-            print("video_token_id:", self._get_config_attr("video_token_id", None) if hasattr(self, "_get_config_attr") else getattr(getattr(self.model, "config", None), "video_token_id", None))
-            print("==============================")
-            self._printed_mm_debug = True
 
         return kwargs
 
@@ -333,9 +199,6 @@ class RolloutMixin:
         return kwargs
 
     def generate_rollout(self, batch: dict[str, Any]) -> torch.Tensor:
-        if self.method_args.rollout_backend == "reference":
-            return batch["input_ids"]
-
         student_rollout = getattr(self, "student_rollout", None)
         if student_rollout is not None:
             config = getattr(self.model, "config", None)
