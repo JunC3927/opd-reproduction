@@ -36,7 +36,7 @@ from probe_student_vllm_rollout_sync import (  # noqa: E402
     weight_items_from_model,
 )
 from src.hparams import parse_torch_dtype  # noqa: E402
-from src.method.vllm_student_client import RemoteStudentRollout  # noqa: E402
+from src.method.vllm_student import RemoteStudentRollout  # noqa: E402
 from src.model import ModelTuner, load_vision_language_model  # noqa: E402
 
 

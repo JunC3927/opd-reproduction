@@ -5,6 +5,8 @@ from typing import Any
 
 import torch
 
+from .rpc import rpc_call
+
 
 def is_rank_zero_process() -> bool:
     return int(os.environ.get("RANK", os.environ.get("LOCAL_RANK", "0"))) == 0
@@ -19,6 +21,98 @@ def resolve_cuda_device(device: str | None) -> str | None:
             return None
         return f"cuda:{int(os.environ.get('LOCAL_RANK', '0'))}"
     return device
+
+
+class RemoteTeacherScorer:
+    def __init__(
+        self,
+        *,
+        host: str,
+        port: int,
+        timeout: float,
+        topk: int,
+    ) -> None:
+        self.host = host
+        self.port = int(port)
+        self.timeout = float(timeout)
+        self.topk = int(topk)
+
+    @torch.no_grad()
+    def score(
+        self,
+        *,
+        sequences: torch.Tensor,
+        attention_mask: torch.Tensor,
+        images_per_sample: list[list[Any]] | None,
+        image_token_id: int | None,
+        video_token_id: int | None,
+        pad_token_id: int,
+        model_kwargs: dict[str, Any] | None = None,
+        mm_processor_kwargs_per_sample: list[dict[str, Any] | None] | None = None,
+        multi_modal_data_per_sample: list[dict[str, Any] | None] | None = None,
+        response_mask: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        device = sequences.device
+        cpu_model_kwargs = None
+        if model_kwargs is not None:
+            cpu_model_kwargs = {
+                key: value.detach().cpu() if torch.is_tensor(value) else value
+                for key, value in model_kwargs.items()
+            }
+        request = {
+            "op": "score",
+            "sequences": sequences.detach().cpu(),
+            "attention_mask": attention_mask.detach().cpu(),
+            "response_mask": None if response_mask is None else response_mask.detach().cpu(),
+            "images_per_sample": images_per_sample,
+            "image_token_id": image_token_id,
+            "video_token_id": video_token_id,
+            "pad_token_id": int(pad_token_id),
+            "topk": self.topk,
+            "model_kwargs": cpu_model_kwargs,
+            "mm_processor_kwargs_per_sample": mm_processor_kwargs_per_sample,
+            "multi_modal_data_per_sample": multi_modal_data_per_sample,
+        }
+        response = rpc_call(self.host, self.port, request, self.timeout)
+        if not isinstance(response, dict):
+            raise RuntimeError(f"Unexpected teacher server response type: {type(response)}")
+        if response.get("ok") is not True:
+            raise RuntimeError(response.get("error") or "Remote teacher scoring failed.")
+
+        logps = response["teacher_topk_logps"].to(device=device, dtype=torch.float32)
+        ids = response["teacher_topk_ids"].to(device=device, dtype=torch.long)
+        return logps, ids
+
+    @torch.no_grad()
+    def score_prompt_requests(
+        self,
+        *,
+        requests: list[dict[str, Any]],
+        pad_token_id: int,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        response = rpc_call(
+            self.host,
+            self.port,
+            {
+                "op": "score_prompt_requests",
+                "requests": requests,
+                "pad_token_id": int(pad_token_id),
+                "topk": self.topk,
+            },
+            self.timeout,
+        )
+        if not isinstance(response, dict):
+            raise RuntimeError(f"Unexpected teacher server response type: {type(response)}")
+        if response.get("ok") is not True:
+            raise RuntimeError(response.get("error") or "Remote teacher scoring failed.")
+
+        logps = response["teacher_topk_logps"].to(dtype=torch.float32)
+        ids = response["teacher_topk_ids"].to(dtype=torch.long)
+        lengths = response["teacher_lengths"].to(dtype=torch.long)
+        return logps, ids, lengths
+
+
+RemoteVLLMTeacherScorer = RemoteTeacherScorer
 
 
 class VLLMTeacherScorer:

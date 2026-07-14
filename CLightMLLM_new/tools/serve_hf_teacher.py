@@ -20,7 +20,7 @@ from src.hparams import ModelArguments  # noqa: E402
 from src.model import load_vision_language_model  # noqa: E402
 
 try:
-    from src.method.teacher_rpc import recv_message, send_message  # noqa: E402
+    from src.method.rpc import recv_message, send_message  # noqa: E402
 except ModuleNotFoundError:
     HEADER = struct.Struct("!Q")
 

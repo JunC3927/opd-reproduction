@@ -27,7 +27,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from src.method.teacher_rpc import recv_message, send_message  # noqa: E402
+from src.method.rpc import recv_message, send_message  # noqa: E402
 from src.method.vllm_student import VLLMStudentRollout  # noqa: E402
 from src.model import load_processor_and_tokenizer  # noqa: E402
 from src.hparams import ModelArguments, parse_torch_dtype  # noqa: E402

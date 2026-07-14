@@ -11,7 +11,7 @@ ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
-from src.method.teacher_rpc import recv_message, send_message  # noqa: E402
+from src.method.rpc import recv_message, send_message  # noqa: E402
 from src.method.vllm_teacher import VLLMTeacherScorer  # noqa: E402
 
 

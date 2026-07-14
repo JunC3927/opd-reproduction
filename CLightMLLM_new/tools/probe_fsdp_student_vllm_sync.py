@@ -59,8 +59,7 @@ from src.hparams import (  # noqa: E402
     TuningArguments,
     parse_torch_dtype,
 )
-from src.method.vllm_student_client import RemoteStudentRollout  # noqa: E402
-from src.method.vllm_student import describe_weight_items_for_ipc  # noqa: E402
+from src.method.vllm_student import RemoteStudentRollout, describe_weight_items_for_ipc  # noqa: E402
 from src.method.vllm_student import VLLMStudentRollout  # noqa: E402
 from src.model import ModelTuner, load_vision_language_model  # noqa: E402
 

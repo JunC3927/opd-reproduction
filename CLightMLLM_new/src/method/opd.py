@@ -12,10 +12,8 @@ from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from ..hparams import parse_torch_dtype
 from .base import BaseLearner
 from .rollout import RolloutMixin
-from .vllm_student import VLLMStudentRollout, describe_weight_items_for_ipc
-from .vllm_student_client import RemoteStudentRollout
-from .vllm_teacher import VLLMTeacherScorer
-from .vllm_teacher_client import RemoteTeacherScorer, RemoteVLLMTeacherScorer
+from .vllm_student import RemoteStudentRollout, VLLMStudentRollout, describe_weight_items_for_ipc
+from .vllm_teacher import RemoteTeacherScorer, RemoteVLLMTeacherScorer, VLLMTeacherScorer
 
 
 def is_rank_zero_process() -> bool:
