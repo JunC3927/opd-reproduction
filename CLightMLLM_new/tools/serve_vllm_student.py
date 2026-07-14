@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Shared vLLM student rollout server for CLight OPD probes.
+"""Shared vLLM student rollout server for CLight OPD training.
 
 This server is intentionally separate from torchrun/Lightning. It owns one
 student vLLM engine, serves rollout generation requests, and can hot-load
-exported student weights through the existing bucketed IPC path.
+student weights through the existing bucketed IPC path.
 """
 
 from __future__ import annotations
@@ -68,38 +68,6 @@ def image_count(images_per_sample: Any) -> int:
     return sum(len(images) for images in images_per_sample)
 
 
-def resolve_path(path: str) -> Path:
-    candidate = Path(path)
-    return candidate if candidate.is_absolute() else ROOT / candidate
-
-
-def load_exported_state(path: str) -> tuple[list[tuple[str, torch.Tensor]], dict[str, Any]]:
-    state_path = resolve_path(path)
-    print(f"[student server] state load start path={state_path}", flush=True)
-    start = time.time()
-    try:
-        payload = torch.load(state_path, map_location="cpu", weights_only=False)
-    except TypeError:
-        payload = torch.load(state_path, map_location="cpu")
-    if isinstance(payload, dict) and "state_dict" in payload:
-        state_dict = payload["state_dict"]
-        metadata = {key: value for key, value in payload.items() if key != "state_dict"}
-    elif isinstance(payload, dict):
-        state_dict = payload
-        metadata = {"format": "raw_state_dict"}
-    else:
-        raise TypeError(f"Unexpected exported state payload type: {type(payload)}")
-    weights = [(name, tensor.detach()) for name, tensor in state_dict.items() if torch.is_tensor(tensor)]
-    total_numel = sum(tensor.numel() for _, tensor in weights)
-    print(
-        "[student server] state load done "
-        f"seconds={time.time() - start:.3f} tensors={len(weights)} total_numel={total_numel:,} "
-        f"metadata={metadata}",
-        flush=True,
-    )
-    return weights, metadata
-
-
 class StudentState:
     def __init__(
         self,
@@ -162,7 +130,7 @@ class StudentHandler(socketserver.BaseRequestHandler):
                 threading.Thread(target=server.shutdown, daemon=True).start()
                 return
 
-            if op not in {"generate", "sync_state_dict", "start_weight_sync", "finish_weight_sync"}:
+            if op not in {"generate", "start_weight_sync", "finish_weight_sync"}:
                 send_message(self.request, {"ok": False, "error": f"Unsupported op: {op!r}"})
                 return
 
@@ -174,12 +142,6 @@ class StudentHandler(socketserver.BaseRequestHandler):
                         f"prompt={tensor_shape(batch.get('prompt_input_ids'))} "
                         f"images={image_count(batch.get('vllm_images'))} "
                         f"weight_version={server.state.weight_version}",
-                        flush=True,
-                    )
-                elif op == "sync_state_dict":
-                    print(
-                        f"[student request {request_id}] received op=sync_state_dict "
-                        f"path={request.get('state_dict_path')}",
                         flush=True,
                     )
                 else:
@@ -320,35 +282,6 @@ class StudentHandler(socketserver.BaseRequestHandler):
                     )
                     return
 
-                weights, metadata = load_exported_state(str(request["state_dict_path"]))
-                start = time.time()
-                summary = server.state.rollout.sync_from_weight_items_ipc(
-                    weights,
-                    bucket_size_mb=server.state.bucket_size_mb,
-                    use_shm=server.state.use_shm,
-                    timeout_sec=server.state.ipc_timeout_sec,
-                    sync_dtype=server.state.sync_dtype,
-                )
-                server.state.weight_version += 1
-                del weights
-                gc.collect()
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
-                print(
-                    f"[student request {request_id}] sync_done "
-                    f"seconds={time.time() - start:.3f} weight_version={server.state.weight_version} "
-                    f"summary={summary}",
-                    flush=True,
-                )
-                send_message(
-                    self.request,
-                    {
-                        "ok": True,
-                        "weight_version": server.state.weight_version,
-                        "summary": summary,
-                        "metadata": metadata,
-                    },
-                )
         except Exception:
             print("[student request] failed:\n" + traceback.format_exc(), flush=True)
             send_message(self.request, {"ok": False, "error": traceback.format_exc()})

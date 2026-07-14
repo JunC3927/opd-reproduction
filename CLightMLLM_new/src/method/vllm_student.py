@@ -5,7 +5,6 @@ import functools
 import sys
 import threading
 import time
-import uuid
 import warnings
 from pathlib import Path
 from typing import Any
@@ -371,19 +370,6 @@ class RemoteStudentRollout:
             flush=True,
         )
         return sequences, weight_version
-
-    def sync_state_dict(self, state_dict_path: str) -> dict[str, Any]:
-        return self._checked_response(
-            rpc_call(
-                self.host,
-                self.port,
-                {
-                    "op": "sync_state_dict",
-                    "state_dict_path": state_dict_path,
-                },
-                self.timeout,
-            )
-        )
 
     def sync_weight_items_ipc(
         self,
@@ -761,98 +747,6 @@ class VLLMStudentRollout:
             "zmq_handle": zmq_handle,
             "use_shm": bool(use_shm),
             "started_at": time.time(),
-        }
-
-    def sync_from_weight_items_ipc(
-        self,
-        weights: list[tuple[str, torch.Tensor]],
-        *,
-        bucket_size_mb: int = 512,
-        use_shm: bool = False,
-        timeout_sec: float = 600.0,
-        sync_dtype: torch.dtype | None = None,
-    ) -> dict[str, Any]:
-        if not weights:
-            return {
-                "weight_count": 0,
-                "sender_sec": 0.0,
-                "total_sec": 0.0,
-                "path": "skipped_empty",
-            }
-
-        previous_device = None
-        ipc_device = None
-        if not use_shm and self.device is not None and str(self.device).startswith("cuda") and torch.cuda.is_available():
-            ipc_device = torch.device(self.device)
-            previous_device = torch.cuda.current_device()
-            if ipc_device.index is not None:
-                torch.cuda.set_device(ipc_device.index)
-
-        apply_model, owner_name = self._resolve_apply_model_for_ipc()
-
-        try:
-            zmq_handle = f"ipc:///tmp/clight-student-vllm-ipc-{os.getpid()}-{uuid.uuid4().hex}.sock"
-            result_box: dict[str, Any] = {}
-
-            def receiver_target() -> None:
-                try:
-                    result_box["result"] = apply_model(
-                        functools.partial(_ipc_load_weights_on_worker, zmq_handle=zmq_handle, use_shm=use_shm)
-                    )
-                    result_box["ok"] = True
-                except Exception as exc:
-                    result_box["ok"] = False
-                    result_box["error"] = f"{type(exc).__name__}: {exc}"
-
-            total_start = time.time()
-            receiver_thread = threading.Thread(
-                target=receiver_target,
-                name="clight-student-vllm-ipc-receiver",
-                daemon=True,
-            )
-            receiver_thread.start()
-            time.sleep(0.5)
-            if result_box.get("ok") is False:
-                raise RuntimeError(f"Student vLLM IPC receiver failed before send: {result_box.get('error')}")
-
-            sender_start = time.time()
-            sender_summary = send_weight_items_ipc(
-                weights,
-                zmq_handle=zmq_handle,
-                bucket_size_mb=bucket_size_mb,
-                use_shm=use_shm,
-                device=ipc_device,
-                sync_dtype=sync_dtype,
-            )
-            sender_sec = time.time() - sender_start
-
-            receiver_thread.join(timeout=timeout_sec)
-            if receiver_thread.is_alive():
-                raise TimeoutError(f"Student vLLM IPC receiver timed out after {timeout_sec}s.")
-            if not result_box.get("ok"):
-                raise RuntimeError(f"Student vLLM IPC receiver failed: {result_box.get('error')}")
-        finally:
-            if previous_device is not None:
-                torch.cuda.set_device(previous_device)
-
-        total_sec = time.time() - total_start
-        if os.getenv("CLIGHT_OPD_VLLM_DEBUG") == "1" and is_rank_zero_process():
-            print(
-                "OPD student vLLM IPC synced:",
-                f"weights={sender_summary['weight_count']}",
-                f"bucket_size_mb={bucket_size_mb}",
-                f"use_shm={use_shm}",
-                f"sender_sec={sender_sec:.3f}",
-                f"total_sec={total_sec:.3f}",
-                f"path={owner_name}.apply_model_ipc",
-            )
-
-        return {
-            "weight_count": sender_summary["weight_count"],
-            "sender_sec": sender_sec,
-            "total_sec": total_sec,
-            "path": f"{owner_name}.apply_model_ipc",
-            "receiver_result": result_box.get("result"),
         }
 
     def _find_vllm_model_with_load_weights(self) -> Any:
