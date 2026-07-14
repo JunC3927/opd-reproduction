@@ -44,7 +44,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Probe standalone student vLLM rollout server.")
     parser.add_argument(
         "--config",
-        default="config/continual_sft/qwen3_vl_opd_geo3k.yaml",
+        default="config/opd/qwen3_vl_geo3k_hf.yaml",
         help="CLight YAML config to reuse for model/data/method settings.",
     )
     parser.add_argument("--host", default="127.0.0.1")

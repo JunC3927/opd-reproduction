@@ -226,9 +226,6 @@ class ConsoleMetricsCallback(Callback):
         "train/student_mass",
         "train/topk_overlap_ratio",
         "train/response_tokens_per_rank",
-        "train/param_update_max_abs",
-        "train/param_update_mean_abs",
-        "train/param_update_rel_mean",
     )
 
     def __init__(self, every_n_steps: int = 1, keys: tuple[str, ...] | None = None) -> None:

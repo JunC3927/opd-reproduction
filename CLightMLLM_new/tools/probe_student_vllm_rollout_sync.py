@@ -93,7 +93,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Probe HF student -> vLLM student rollout sync.")
     parser.add_argument(
         "--config",
-        default="config/continual_sft/qwen3_vl_opd_geo3k.yaml",
+        default="config/opd/qwen3_vl_geo3k_hf.yaml",
         help="CLight YAML config to reuse for model/data/method settings.",
     )
     parser.add_argument("--stage-index", type=int, default=0, help="CL SFT stage index to sample from.")

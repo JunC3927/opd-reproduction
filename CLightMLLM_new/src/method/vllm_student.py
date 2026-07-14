@@ -1,5 +1,4 @@
 import os
-import ast
 import asyncio
 from contextlib import contextmanager
 import functools
@@ -125,105 +124,6 @@ def _infer_model_device(model: torch.nn.Module) -> torch.device:
     if torch.cuda.is_available():
         return torch.device("cuda", torch.cuda.current_device())
     return torch.device("cpu")
-
-
-def _candidate_vllm_weight_names(name: str) -> list[str]:
-    candidates = [name]
-    if name.startswith("model."):
-        candidates.append(name[len("model.") :])
-    if name.startswith("model.language_model."):
-        tail = name[len("model.language_model.") :]
-        candidates.extend(
-            [
-                f"language_model.{tail}",
-                f"model.{tail}",
-                tail,
-            ]
-        )
-    if name.startswith("language_model."):
-        candidates.append(name[len("language_model.") :])
-
-    packed_attention_candidates = []
-    for candidate in candidates:
-        for proj_name in ("q_proj", "k_proj", "v_proj"):
-            marker = f".self_attn.{proj_name}."
-            if marker in candidate:
-                packed_attention_candidates.append(candidate.replace(marker, ".self_attn.qkv_proj.", 1))
-    candidates.extend(packed_attention_candidates)
-
-    result = []
-    seen = set()
-    for candidate in candidates:
-        if candidate and candidate not in seen:
-            seen.add(candidate)
-            result.append(candidate)
-    return result
-
-
-def _resolve_vllm_weight_tensor(named_tensors: dict[str, torch.Tensor], name: str) -> tuple[str | None, torch.Tensor | None, dict[str, Any]]:
-    for candidate in _candidate_vllm_weight_names(name):
-        tensor = named_tensors.get(candidate)
-        if tensor is not None:
-            return candidate, tensor, {"match_type": "exact_or_alias", "candidates": _candidate_vllm_weight_names(name)}
-
-    parts = [part for part in name.split(".") if part]
-    suffixes = []
-    for suffix_len in range(min(6, len(parts)), 1, -1):
-        suffixes.append(".".join(parts[-suffix_len:]))
-    suffixes.append(parts[-1] if parts else name)
-
-    for suffix in suffixes:
-        matches = [key for key in named_tensors if key == suffix or key.endswith(f".{suffix}")]
-        if len(matches) == 1:
-            resolved = matches[0]
-            return resolved, named_tensors[resolved], {"match_type": "unique_suffix", "suffix": suffix}
-        if len(matches) > 1:
-            return None, None, {
-                "match_type": "ambiguous_suffix",
-                "suffix": suffix,
-                "matches": sorted(matches)[:20],
-                "match_count": len(matches),
-            }
-
-    return None, None, {"match_type": "not_found"}
-
-
-def _fingerprint_weight_on_worker(model: Any, name: str, numel: int) -> str:
-    named_tensors = dict(model.named_parameters())
-    named_tensors.update(dict(model.named_buffers()))
-    resolved_name, tensor, resolution = _resolve_vllm_weight_tensor(named_tensors, name)
-    if tensor is None:
-        available = sorted(named_tensors)[:20]
-        return repr(
-            {
-                "ok": False,
-                "error": f"Tensor {name!r} was not found in vLLM model.",
-                "requested_name": name,
-                "resolution": resolution,
-                "available_head": available,
-            }
-        )
-
-    sample = tensor.detach().flatten()[: int(numel)].float().cpu()
-    sample_abs = sample.abs()
-    return repr(
-        {
-            "ok": True,
-            "name": resolved_name,
-            "requested_name": name,
-            "resolved_name": resolved_name,
-            "resolution": resolution,
-            "numel": int(sample.numel()),
-            "shape": tuple(int(dim) for dim in tensor.shape),
-            "dtype": str(tensor.dtype),
-            "device": str(tensor.device),
-            "sum": float(sample.sum().item()),
-            "mean": float(sample.mean().item()) if sample.numel() else 0.0,
-            "abs_sum": float(sample_abs.sum().item()),
-            "sq_sum": float((sample * sample).sum().item()),
-            "max_abs": float(sample_abs.max().item()) if sample.numel() else 0.0,
-        }
-    )
 
 
 def _ipc_load_weights_on_worker(model: Any, zmq_handle: str, use_shm: bool) -> str:
@@ -480,20 +380,6 @@ class RemoteStudentRollout:
                 {
                     "op": "sync_state_dict",
                     "state_dict_path": state_dict_path,
-                },
-                self.timeout,
-            )
-        )
-
-    def fingerprint_weight(self, name: str, *, numel: int = 256) -> dict[str, Any]:
-        return self._checked_response(
-            rpc_call(
-                self.host,
-                self.port,
-                {
-                    "op": "fingerprint_weight",
-                    "name": name,
-                    "numel": int(numel),
                 },
                 self.timeout,
             )
@@ -990,20 +876,3 @@ class VLLMStudentRollout:
             "This vLLM version may hide the in-process model runner; use HF rollout "
             "or add a version-specific vLLM weight sync adapter."
         )
-
-    def fingerprint_weight(self, name: str, *, numel: int = 256) -> dict[str, Any]:
-        apply_model, owner_name = self._resolve_apply_model_for_ipc()
-        raw_result = apply_model(functools.partial(_fingerprint_weight_on_worker, name=name, numel=int(numel)))
-        first = raw_result[0] if isinstance(raw_result, list) and raw_result else raw_result
-        if isinstance(first, str):
-            try:
-                parsed = ast.literal_eval(first)
-            except (SyntaxError, ValueError):
-                parsed = {"ok": False, "error": f"Could not parse fingerprint result: {first!r}"}
-        elif isinstance(first, dict):
-            parsed = first
-        else:
-            parsed = {"ok": False, "error": f"Unexpected fingerprint result type: {type(first)}"}
-        parsed["path"] = f"{owner_name}.apply_model_fingerprint"
-        parsed["raw_result"] = raw_result
-        return parsed

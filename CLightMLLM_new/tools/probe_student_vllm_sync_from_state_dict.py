@@ -71,7 +71,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Sync exported FSDP full state into student vLLM.")
     parser.add_argument(
         "--config",
-        default="config/continual_sft/qwen3_vl_opd_geo3k.yaml",
+        default="config/opd/qwen3_vl_geo3k_hf.yaml",
         help="CLight YAML config used for model/tokenizer paths.",
     )
     parser.add_argument(

@@ -1,5 +1,4 @@
 import math
-import os
 from typing import Any
 
 import lightning as L
@@ -22,9 +21,6 @@ class BaseLearner(L.LightningModule):
         super().__init__()
         self.model = model
         self.optimizer_args = optimizer_args
-        self._tracked_param_name: str | None = None
-        self._tracked_param_before: torch.Tensor | None = None
-        self._tracked_param_before_abs_mean: torch.Tensor | None = None
 
     def training_step(self, batch: dict[str, torch.Tensor], batch_idx: int) -> torch.Tensor:
         loss = self.compute_loss(batch)
@@ -57,18 +53,13 @@ class BaseLearner(L.LightningModule):
         )
 
     def on_before_optimizer_step(self, optimizer) -> None:
-        self.log_tracked_param_update()
-
         grad_sq = None
-        tracked_candidates = []
         for name, param in self.model.named_parameters():
             grad = param.grad
             if grad is None:
                 continue
             local_sq = grad.detach().float().pow(2).sum()
             grad_sq = local_sq if grad_sq is None else grad_sq + local_sq
-            if param.requires_grad and param.numel() > 0 and param.ndim >= 2:
-                tracked_candidates.append((name, param))
 
         if grad_sq is not None:
             if dist.is_available() and dist.is_initialized():
@@ -79,74 +70,6 @@ class BaseLearner(L.LightningModule):
                 prog_bar=False,
                 logger=True,
                 sync_dist=False,
-            )
-
-        tracked = self.select_tracked_param(tracked_candidates)
-        if tracked is not None:
-            name, param = tracked
-            param_slice = param.detach().flatten()[:1024].float().cpu().clone()
-            self._tracked_param_name = name
-            self._tracked_param_before = param_slice
-            self._tracked_param_before_abs_mean = param_slice.abs().mean()
-
-    @staticmethod
-    def select_tracked_param(candidates: list[tuple[str, torch.nn.Parameter]]) -> tuple[str, torch.nn.Parameter] | None:
-        if not candidates:
-            return None
-
-        preferred_marks = (
-            "lm_head.weight",
-            "language_model",
-            "model.layers",
-            "model.language_model",
-            "embed_tokens.weight",
-        )
-        for mark in preferred_marks:
-            for name, param in candidates:
-                if mark in name:
-                    return name, param
-        return candidates[-1]
-
-    def log_tracked_param_update(self) -> None:
-        before = self._tracked_param_before
-        name = self._tracked_param_name
-        if before is None or name is None:
-            return
-
-        current_param = None
-        for param_name, param in self.model.named_parameters():
-            if param_name == name:
-                current_param = param
-                break
-        if current_param is None:
-            return
-
-        after = current_param.detach().flatten()[: before.numel()].float().cpu()
-        delta = (after - before).abs()
-        device = self.device if isinstance(self.device, torch.device) else torch.device("cpu")
-        max_abs = delta.max().to(device)
-        mean_abs = delta.mean().to(device)
-        denom = (self._tracked_param_before_abs_mean or before.abs().mean()).clamp_min(1.0e-12).to(device)
-        rel_mean = mean_abs / denom
-        if dist.is_available() and dist.is_initialized():
-            dist.all_reduce(max_abs, op=dist.ReduceOp.MAX)
-            dist.all_reduce(mean_abs, op=dist.ReduceOp.SUM)
-            dist.all_reduce(rel_mean, op=dist.ReduceOp.SUM)
-            mean_abs = mean_abs / dist.get_world_size()
-            rel_mean = rel_mean / dist.get_world_size()
-        self.log("train/param_update_max_abs", max_abs, logger=True, prog_bar=False, sync_dist=False)
-        self.log("train/param_update_mean_abs", mean_abs, logger=True, prog_bar=False, sync_dist=False)
-        self.log("train/param_update_rel_mean", rel_mean, logger=True, prog_bar=False, sync_dist=False)
-
-        rank = dist.get_rank() if dist.is_available() and dist.is_initialized() else int(os.environ.get("RANK", "0"))
-        if os.environ.get("CLIGHT_UPDATE_DEBUG") == "1" and rank == 0:
-            print(
-                "CLight update debug:",
-                f"param={name}",
-                f"max_abs={float(max_abs.detach().cpu())}",
-                f"mean_abs={float(mean_abs.detach().cpu())}",
-                f"rel_mean={float(rel_mean.detach().cpu())}",
-                flush=True,
             )
 
     def configure_gradient_clipping(

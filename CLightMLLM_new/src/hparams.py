@@ -87,11 +87,6 @@ class MethodArguments:
     rollout_student_server_sync_dtype: str | None = "none"
     rollout_student_server_summon_rank0_only: bool = True
     rollout_student_server_summon_offload_to_cpu: bool = False
-    rollout_student_server_verify_sync: bool = False
-    rollout_student_server_verify_name: str | None = None
-    rollout_student_server_verify_numel: int = 256
-    rollout_student_server_verify_rtol: float = 5.0e-3
-    rollout_student_server_verify_atol: float = 5.0e-3
     grpo_reward_type: Literal["reference_match", "length", "none"] = "reference_match"
     grpo_kl_coef: float = 0.0
     grpo_reference_model: bool = False
@@ -161,10 +156,6 @@ class MethodArguments:
             sync_dtype = str(self.rollout_student_server_sync_dtype).lower()
             if sync_dtype not in {"none", "null"}:
                 parse_torch_dtype(sync_dtype)
-        if self.rollout_student_server_verify_numel <= 0:
-            raise ValueError("method.rollout_student_server_verify_numel must be positive.")
-        if self.rollout_student_server_verify_rtol < 0 or self.rollout_student_server_verify_atol < 0:
-            raise ValueError("method rollout student server verify tolerances must be non-negative.")
         if self.grpo_kl_coef < 0:
             raise ValueError("method.grpo_kl_coef must be non-negative.")
         if self.opd_alpha < 0:
