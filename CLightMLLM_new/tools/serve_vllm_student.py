@@ -55,46 +55,24 @@ def scrub_torchrun_env() -> None:
         os.environ.pop(key, None)
 
 
-def tensor_shape(value: Any) -> tuple[int, ...] | None:
-    shape = getattr(value, "shape", None)
-    if shape is None:
-        return None
-    return tuple(int(dim) for dim in shape)
-
-
-def image_count(images_per_sample: Any) -> int:
-    if images_per_sample is None:
-        return 0
-    return sum(len(images) for images in images_per_sample)
-
-
 class StudentState:
     def __init__(
         self,
         rollout: VLLMStudentRollout,
         *,
-        log_requests: bool,
         bucket_size_mb: int,
         use_shm: bool,
         ipc_timeout_sec: float,
         sync_dtype: torch.dtype | None,
     ) -> None:
         self.rollout = rollout
-        self.log_requests = log_requests
         self.bucket_size_mb = int(bucket_size_mb)
         self.use_shm = bool(use_shm)
         self.ipc_timeout_sec = float(ipc_timeout_sec)
         self.sync_dtype = sync_dtype
         self.weight_version = 0
         self.lock = threading.Lock()
-        self.request_lock = threading.Lock()
-        self.request_count = 0
         self.active_sync_session: dict[str, Any] | None = None
-
-    def next_request_id(self) -> int:
-        with self.request_lock:
-            self.request_count += 1
-            return self.request_count
 
 
 class StudentTCPServer(socketserver.ThreadingTCPServer):
@@ -112,7 +90,6 @@ class StudentHandler(socketserver.BaseRequestHandler):
             op = request.get("op") if isinstance(request, dict) else None
             server = self.server
             assert isinstance(server, StudentTCPServer)
-            request_id = server.state.next_request_id()
 
             if op == "ping":
                 send_message(
@@ -134,37 +111,11 @@ class StudentHandler(socketserver.BaseRequestHandler):
                 send_message(self.request, {"ok": False, "error": f"Unsupported op: {op!r}"})
                 return
 
-            if server.state.log_requests:
-                if op == "generate":
-                    batch = request.get("batch") or {}
-                    print(
-                        f"[student request {request_id}] received op=generate "
-                        f"prompt={tensor_shape(batch.get('prompt_input_ids'))} "
-                        f"images={image_count(batch.get('vllm_images'))} "
-                        f"weight_version={server.state.weight_version}",
-                        flush=True,
-                    )
-                else:
-                    print(
-                        f"[student request {request_id}] received op={op} "
-                        f"session_id={request.get('session_id')}",
-                        flush=True,
-                    )
-
-            lock_wait_start = time.time()
             with server.state.lock:
-                if server.state.log_requests:
-                    print(
-                        f"[student request {request_id}] op={op} lock_acquired "
-                        f"wait_sec={time.time() - lock_wait_start:.3f}",
-                        flush=True,
-                    )
-
                 if op == "generate":
                     if server.state.active_sync_session is not None:
                         raise RuntimeError("Cannot generate while a remote weight sync session is active.")
                     method_args = SimpleNamespace(**request["method_args"])
-                    start = time.time()
                     sequences = server.state.rollout.generate(
                         batch=request["batch"],
                         method_args=method_args,
@@ -172,13 +123,6 @@ class StudentHandler(socketserver.BaseRequestHandler):
                         video_token_id=request.get("video_token_id"),
                         pad_token_id=int(request["pad_token_id"]),
                     )
-                    if server.state.log_requests:
-                        print(
-                            f"[student request {request_id}] generate_done "
-                            f"sequences={tensor_shape(sequences)} seconds={time.time() - start:.3f} "
-                            f"weight_version={server.state.weight_version}",
-                            flush=True,
-                        )
                     send_message(
                         self.request,
                         {
@@ -199,13 +143,11 @@ class StudentHandler(socketserver.BaseRequestHandler):
                         request.get("zmq_handle")
                         or f"ipc:///tmp/clight-student-vllm-remote-{os.getpid()}-{session_id}.sock"
                     )
-                    start = time.time()
                     session = server.state.rollout.start_weight_sync_receiver(
                         zmq_handle=zmq_handle,
                         use_shm=use_shm,
                     )
                     session["session_id"] = session_id
-                    session["request_id"] = request_id
                     session["requested_use_shm"] = requested_use_shm
                     server.state.active_sync_session = session
                     time.sleep(0.5)
@@ -214,14 +156,6 @@ class StudentHandler(socketserver.BaseRequestHandler):
                         raise RuntimeError(
                             "Student vLLM remote IPC receiver failed before sender started: "
                             f"{session['result_box'].get('error')}"
-                        )
-                    if server.state.log_requests:
-                        print(
-                            f"[student request {request_id}] remote_sync_receiver_ready "
-                            f"session_id={session_id} zmq_handle={zmq_handle} "
-                            f"use_shm={use_shm} requested_use_shm={requested_use_shm} "
-                            f"seconds={time.time() - start:.3f}",
-                            flush=True,
                         )
                     send_message(
                         self.request,
@@ -268,12 +202,6 @@ class StudentHandler(socketserver.BaseRequestHandler):
                     gc.collect()
                     if torch.cuda.is_available():
                         torch.cuda.empty_cache()
-                    if server.state.log_requests:
-                        print(
-                            f"[student request {request_id}] remote_sync_done "
-                            f"weight_version={server.state.weight_version} summary={summary}",
-                            flush=True,
-                        )
                     send_message(
                         self.request,
                         {
@@ -319,12 +247,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--ipc-use-shm", action="store_true")
     parser.add_argument("--ipc-timeout-sec", type=float, default=900.0)
     parser.add_argument("--sync-dtype", default="bfloat16")
-    parser.add_argument(
-        "--log-requests",
-        action=argparse.BooleanOptionalAction,
-        default=False,
-        help="Print one-line request lifecycle logs.",
-    )
     parser.set_defaults(
         enable_chunked_prefill=None,
         enable_prefix_caching=None,
@@ -359,7 +281,6 @@ def main() -> None:
         f"image_max_pixels={args.image_max_pixels}",
         f"ipc_bucket_size_mb={args.ipc_bucket_size_mb}",
         f"sync_dtype={args.sync_dtype}",
-        f"log_requests={args.log_requests}",
         f"CUDA_VISIBLE_DEVICES={os.environ.get('CUDA_VISIBLE_DEVICES')}",
         flush=True,
     )
@@ -402,7 +323,6 @@ def main() -> None:
 
     state = StudentState(
         rollout,
-        log_requests=args.log_requests,
         bucket_size_mb=args.ipc_bucket_size_mb,
         use_shm=args.ipc_use_shm,
         ipc_timeout_sec=args.ipc_timeout_sec,

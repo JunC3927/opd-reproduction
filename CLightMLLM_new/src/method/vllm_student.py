@@ -18,14 +18,6 @@ if str(VERL_ROOT) not in sys.path:
     sys.path.insert(0, str(VERL_ROOT))
 
 
-def is_rank_zero_process() -> bool:
-    return int(os.environ.get("RANK", os.environ.get("LOCAL_RANK", "0"))) == 0
-
-
-def verbose_student_vllm_logs() -> bool:
-    return os.getenv("CLIGHT_OPD_STUDENT_VLLM_LOGS") == "1" or os.getenv("CLIGHT_OPD_VLLM_DEBUG") == "1"
-
-
 def resolve_cuda_device(device: str | None) -> str | None:
     if device is None:
         return None
@@ -294,14 +286,6 @@ class RemoteStudentRollout:
         video_token_id: int | None,
         pad_token_id: int,
     ) -> tuple[torch.Tensor, int]:
-        verbose = verbose_student_vllm_logs()
-        started = time.time() if verbose else None
-        if verbose:
-            print(
-                f"[student-vllm-client rank={self._rank}] generate start: "
-                f"server={self.host}:{self.port}, batch={int(batch['prompt_input_ids'].shape[0])}",
-                flush=True,
-            )
         device = batch["prompt_input_ids"].device
         request = {
             "op": "generate",
@@ -314,14 +298,6 @@ class RemoteStudentRollout:
         response = self._checked_response(rpc_call(self.host, self.port, request, self.timeout))
         sequences = response["sequences"].to(device=device, dtype=batch["prompt_input_ids"].dtype)
         weight_version = int(response.get("weight_version", 0))
-        if verbose:
-            assert started is not None
-            print(
-                f"[student-vllm-client rank={self._rank}] generate done: "
-                f"seconds={time.time() - started:.3f}, shape={tuple(sequences.shape)}, "
-                f"weight_version={weight_version}",
-                flush=True,
-            )
         return sequences, weight_version
 
     def sync_weight_items_ipc(
@@ -443,18 +419,7 @@ class VLLMStudentRollout:
             previous_device = torch.cuda.current_device()
             index = torch.device(device).index
             if index is not None:
-                if os.getenv("CLIGHT_OPD_VLLM_DEBUG") == "1" and is_rank_zero_process():
-                    print(f"OPD student rollout vLLM set_device(cuda:{index})")
                 torch.cuda.set_device(index)
-                if os.getenv("CLIGHT_OPD_VLLM_DEBUG") == "1" and is_rank_zero_process():
-                    free, total = torch.cuda.mem_get_info(index)
-                    print(
-                        "OPD student rollout vLLM memory before init:",
-                        f"cuda:{index}",
-                        f"free={free / 1024**3:.2f}GiB",
-                        f"total={total / 1024**3:.2f}GiB",
-                        f"gpu_memory_utilization={gpu_memory_utilization}",
-                    )
 
         llm_kwargs: dict[str, Any] = {
             "model": model_path,
@@ -611,14 +576,6 @@ class VLLMStudentRollout:
             token_ids = token_ids[:max_completion_len]
             if token_ids:
                 completion_tensor[row_idx, : len(token_ids)] = torch.tensor(token_ids, dtype=prompt_ids.dtype, device=device)
-
-        if os.getenv("CLIGHT_OPD_VLLM_DEBUG") == "1" and is_rank_zero_process():
-            print(
-                "OPD student vLLM rollout:",
-                f"batch={batch_size}",
-                f"prompt_width={prompt_width}",
-                f"completion_width={max_completion_len}",
-            )
 
         return torch.cat([prompt_ids, completion_tensor], dim=1)
 
