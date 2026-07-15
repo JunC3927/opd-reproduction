@@ -20,6 +20,10 @@ def is_rank_zero_process() -> bool:
     return int(os.environ.get("RANK", os.environ.get("LOCAL_RANK", "0"))) == 0
 
 
+def verbose_student_vllm_logs() -> bool:
+    return os.getenv("CLIGHT_OPD_STUDENT_VLLM_LOGS") == "1" or os.getenv("CLIGHT_OPD_VLLM_DEBUG") == "1"
+
+
 class OPDLearner(RolloutMixin, BaseLearner):
     def __init__(
         self,
@@ -140,14 +144,16 @@ class OPDLearner(RolloutMixin, BaseLearner):
         rank = self._dist_rank()
         local_rank = int(os.environ.get("LOCAL_RANK", "0"))
         sync_dtype = self._remote_sync_dtype()
+        verbose = verbose_student_vllm_logs()
         start = time.time()
-        print(
-            f"[student-vllm-sync rank={rank}] remote weight sync start: "
-            f"step={current_step}, backend=remote_ipc_summon, "
-            f"rank0_only={self.method_args.rollout_student_server_summon_rank0_only}, "
-            f"offload_to_cpu={self.method_args.rollout_student_server_summon_offload_to_cpu}",
-            flush=True,
-        )
+        if verbose:
+            print(
+                f"[student-vllm-sync rank={rank}] remote weight sync start: "
+                f"step={current_step}, backend=remote_ipc_summon, "
+                f"rank0_only={self.method_args.rollout_student_server_summon_rank0_only}, "
+                f"offload_to_cpu={self.method_args.rollout_student_server_summon_offload_to_cpu}",
+                flush=True,
+            )
 
         response = None
         with self._summon_full_params_compat(
@@ -155,22 +161,24 @@ class OPDLearner(RolloutMixin, BaseLearner):
             rank0_only=bool(self.method_args.rollout_student_server_summon_rank0_only),
             offload_to_cpu=bool(self.method_args.rollout_student_server_summon_offload_to_cpu),
         ):
-            print(
-                f"[student-vllm-sync rank={rank}] FSDP summon_full_params entered: "
-                f"step={current_step}, seconds={time.time() - start:.3f}",
-                flush=True,
-            )
+            if verbose:
+                print(
+                    f"[student-vllm-sync rank={rank}] FSDP summon_full_params entered: "
+                    f"step={current_step}, seconds={time.time() - start:.3f}",
+                    flush=True,
+                )
             if rank == 0:
                 weights: list[tuple[str, torch.Tensor]] | None = None
                 try:
                     weights = self._student_model_weight_items()
-                    print(
-                        "[student-vllm-sync rank=0] weight views ready: "
-                        f"step={current_step}, tensors={len(weights)}, sync_dtype={sync_dtype}, "
-                        f"bucket_size_mb={self.method_args.rollout_student_server_sync_bucket_size_mb}, "
-                        f"use_shm={self.method_args.rollout_student_server_sync_use_shm}",
-                        flush=True,
-                    )
+                    if verbose:
+                        print(
+                            "[student-vllm-sync rank=0] weight views ready: "
+                            f"step={current_step}, tensors={len(weights)}, sync_dtype={sync_dtype}, "
+                            f"bucket_size_mb={self.method_args.rollout_student_server_sync_bucket_size_mb}, "
+                            f"use_shm={self.method_args.rollout_student_server_sync_use_shm}",
+                            flush=True,
+                        )
                     response = self.student_rollout.sync_weight_items_ipc(
                         weights,
                         bucket_size_mb=int(self.method_args.rollout_student_server_sync_bucket_size_mb),
@@ -178,20 +186,21 @@ class OPDLearner(RolloutMixin, BaseLearner):
                         device=self.method_args.rollout_student_server_sync_device,
                         sync_dtype=sync_dtype,
                     )
-                    print(
-                        "[student-vllm-sync rank=0] remote weight sync done: "
-                        f"step={current_step}, seconds={time.time() - start:.3f}, "
-                        f"weight_version={response.get('weight_version')}, "
-                        f"summary={response.get('summary')}",
-                        flush=True,
-                    )
+                    if verbose:
+                        print(
+                            "[student-vllm-sync rank=0] remote weight sync done: "
+                            f"step={current_step}, seconds={time.time() - start:.3f}, "
+                            f"weight_version={response.get('weight_version')}, "
+                            f"summary={response.get('summary')}",
+                            flush=True,
+                        )
                 finally:
                     if weights is not None:
                         weights.clear()
                     gc.collect()
             self._dist_barrier("inside-remote-student-sync", local_rank=local_rank)
         self._dist_barrier("post-remote-student-sync", local_rank=local_rank)
-        if rank != 0:
+        if verbose and rank != 0:
             print(
                 f"[student-vllm-sync rank={rank}] remote weight sync done: "
                 f"step={current_step}, seconds={time.time() - start:.3f}",
@@ -288,13 +297,16 @@ class OPDLearner(RolloutMixin, BaseLearner):
     def _dist_barrier(label: str, *, local_rank: int) -> None:
         if not (dist.is_available() and dist.is_initialized()):
             return
-        print(f"[student-vllm-sync rank={dist.get_rank()}] {label} barrier start", flush=True)
+        verbose = verbose_student_vllm_logs()
+        if verbose:
+            print(f"[student-vllm-sync rank={dist.get_rank()}] {label} barrier start", flush=True)
         if str(dist.get_backend()).lower() == "nccl" and torch.cuda.is_available():
             device_id = torch.cuda.current_device()
             dist.barrier(device_ids=[device_id])
         else:
             dist.barrier()
-        print(f"[student-vllm-sync rank={dist.get_rank()}] {label} barrier done", flush=True)
+        if verbose:
+            print(f"[student-vllm-sync rank={dist.get_rank()}] {label} barrier done", flush=True)
 
     def on_save_checkpoint(self, checkpoint: dict) -> None:
         checkpoint["state_dict"] = {

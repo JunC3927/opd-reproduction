@@ -933,6 +933,9 @@ class VLCollator(DataCollatorForSeq2Seq):
         self.template = template
         self.processor = processor
         self.torch_dtype = torch_dtype
+        deprecation_warnings = getattr(self.tokenizer, "deprecation_warnings", None)
+        if isinstance(deprecation_warnings, dict):
+            deprecation_warnings["Asking-to-pad-a-fast-tokenizer"] = True
 
         if isinstance(self.model, PeftModel):
             self.model = self.model.base_model.model

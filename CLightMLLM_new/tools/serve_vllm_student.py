@@ -215,13 +215,14 @@ class StudentHandler(socketserver.BaseRequestHandler):
                             "Student vLLM remote IPC receiver failed before sender started: "
                             f"{session['result_box'].get('error')}"
                         )
-                    print(
-                        f"[student request {request_id}] remote_sync_receiver_ready "
-                        f"session_id={session_id} zmq_handle={zmq_handle} "
-                        f"use_shm={use_shm} requested_use_shm={requested_use_shm} "
-                        f"seconds={time.time() - start:.3f}",
-                        flush=True,
-                    )
+                    if server.state.log_requests:
+                        print(
+                            f"[student request {request_id}] remote_sync_receiver_ready "
+                            f"session_id={session_id} zmq_handle={zmq_handle} "
+                            f"use_shm={use_shm} requested_use_shm={requested_use_shm} "
+                            f"seconds={time.time() - start:.3f}",
+                            flush=True,
+                        )
                     send_message(
                         self.request,
                         {
@@ -267,11 +268,12 @@ class StudentHandler(socketserver.BaseRequestHandler):
                     gc.collect()
                     if torch.cuda.is_available():
                         torch.cuda.empty_cache()
-                    print(
-                        f"[student request {request_id}] remote_sync_done "
-                        f"weight_version={server.state.weight_version} summary={summary}",
-                        flush=True,
-                    )
+                    if server.state.log_requests:
+                        print(
+                            f"[student request {request_id}] remote_sync_done "
+                            f"weight_version={server.state.weight_version} summary={summary}",
+                            flush=True,
+                        )
                     send_message(
                         self.request,
                         {

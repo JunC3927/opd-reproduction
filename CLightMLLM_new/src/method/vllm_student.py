@@ -22,6 +22,10 @@ def is_rank_zero_process() -> bool:
     return int(os.environ.get("RANK", os.environ.get("LOCAL_RANK", "0"))) == 0
 
 
+def verbose_student_vllm_logs() -> bool:
+    return os.getenv("CLIGHT_OPD_STUDENT_VLLM_LOGS") == "1" or os.getenv("CLIGHT_OPD_VLLM_DEBUG") == "1"
+
+
 def resolve_cuda_device(device: str | None) -> str | None:
     if device is None:
         return None
@@ -290,12 +294,14 @@ class RemoteStudentRollout:
         video_token_id: int | None,
         pad_token_id: int,
     ) -> tuple[torch.Tensor, int]:
-        started = time.time()
-        print(
-            f"[student-vllm-client rank={self._rank}] generate start: "
-            f"server={self.host}:{self.port}, batch={int(batch['prompt_input_ids'].shape[0])}",
-            flush=True,
-        )
+        verbose = verbose_student_vllm_logs()
+        started = time.time() if verbose else None
+        if verbose:
+            print(
+                f"[student-vllm-client rank={self._rank}] generate start: "
+                f"server={self.host}:{self.port}, batch={int(batch['prompt_input_ids'].shape[0])}",
+                flush=True,
+            )
         device = batch["prompt_input_ids"].device
         request = {
             "op": "generate",
@@ -308,12 +314,14 @@ class RemoteStudentRollout:
         response = self._checked_response(rpc_call(self.host, self.port, request, self.timeout))
         sequences = response["sequences"].to(device=device, dtype=batch["prompt_input_ids"].dtype)
         weight_version = int(response.get("weight_version", 0))
-        print(
-            f"[student-vllm-client rank={self._rank}] generate done: "
-            f"seconds={time.time() - started:.3f}, shape={tuple(sequences.shape)}, "
-            f"weight_version={weight_version}",
-            flush=True,
-        )
+        if verbose:
+            assert started is not None
+            print(
+                f"[student-vllm-client rank={self._rank}] generate done: "
+                f"seconds={time.time() - started:.3f}, shape={tuple(sequences.shape)}, "
+                f"weight_version={weight_version}",
+                flush=True,
+            )
         return sequences, weight_version
 
     def sync_weight_items_ipc(
