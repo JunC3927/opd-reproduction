@@ -323,14 +323,30 @@ class RemoteStudentRollout:
             )
         )
         resolved_use_shm = bool(start_response.get("use_shm", False))
-        sender_summary = send_weight_items_ipc(
-            weights,
-            zmq_handle=start_response["zmq_handle"],
-            bucket_size_mb=bucket_size_mb,
-            use_shm=resolved_use_shm,
-            device=device,
-            sync_dtype=sync_dtype,
-        )
+        try:
+            sender_summary = send_weight_items_ipc(
+                weights,
+                zmq_handle=start_response["zmq_handle"],
+                bucket_size_mb=bucket_size_mb,
+                use_shm=resolved_use_shm,
+                device=device,
+                sync_dtype=sync_dtype,
+            )
+        except Exception as exc:
+            abort_timeout_sec = min(float(self.timeout), 30.0)
+            try:
+                self.abort_weight_sync(
+                    session_id=str(start_response["session_id"]),
+                    reason=f"{type(exc).__name__}: {exc}",
+                    timeout_sec=abort_timeout_sec,
+                )
+            except Exception as abort_exc:
+                raise RuntimeError(
+                    "Student vLLM IPC sender failed and the server sync session could not be aborted: "
+                    f"sender_error={type(exc).__name__}: {exc}; "
+                    f"abort_error={type(abort_exc).__name__}: {abort_exc}"
+                ) from exc
+            raise
         sender_summary["requested_use_shm"] = use_shm
         sender_summary["resolved_use_shm"] = resolved_use_shm
         finish_response = self._checked_response(
@@ -347,6 +363,27 @@ class RemoteStudentRollout:
         )
         finish_response["sender_summary"] = sender_summary
         return finish_response
+
+    def abort_weight_sync(
+        self,
+        *,
+        session_id: str,
+        reason: str | None = None,
+        timeout_sec: float | None = None,
+    ) -> dict[str, Any]:
+        return self._checked_response(
+            rpc_call(
+                self.host,
+                self.port,
+                {
+                    "op": "abort_weight_sync",
+                    "session_id": session_id,
+                    "reason": reason,
+                    "timeout_sec": timeout_sec,
+                },
+                self.timeout,
+            )
+        )
 
     def shutdown(self) -> dict[str, Any]:
         return self._checked_response(rpc_call(self.host, self.port, {"op": "shutdown"}, self.timeout))

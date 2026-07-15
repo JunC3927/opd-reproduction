@@ -77,6 +77,7 @@ class StudentState:
 
 class StudentTCPServer(socketserver.ThreadingTCPServer):
     allow_reuse_address = True
+    daemon_threads = True
 
     def __init__(self, server_address, RequestHandlerClass, state: StudentState):
         super().__init__(server_address, RequestHandlerClass)
@@ -98,6 +99,7 @@ class StudentHandler(socketserver.BaseRequestHandler):
                         "ok": True,
                         "message": "pong",
                         "weight_version": server.state.weight_version,
+                        "active_sync_session": server.state.active_sync_session is not None,
                     },
                 )
                 return
@@ -107,7 +109,7 @@ class StudentHandler(socketserver.BaseRequestHandler):
                 threading.Thread(target=server.shutdown, daemon=True).start()
                 return
 
-            if op not in {"generate", "start_weight_sync", "finish_weight_sync"}:
+            if op not in {"generate", "start_weight_sync", "finish_weight_sync", "abort_weight_sync"}:
                 send_message(self.request, {"ok": False, "error": f"Unsupported op: {op!r}"})
                 return
 
@@ -166,6 +168,58 @@ class StudentHandler(socketserver.BaseRequestHandler):
                             "use_shm": use_shm,
                             "server_default_use_shm": server.state.use_shm,
                             "weight_version": server.state.weight_version,
+                        },
+                    )
+                    return
+
+                if op == "abort_weight_sync":
+                    session = server.state.active_sync_session
+                    if session is None:
+                        send_message(
+                            self.request,
+                            {
+                                "ok": True,
+                                "message": "no active remote weight sync session",
+                                "weight_version": server.state.weight_version,
+                            },
+                        )
+                        return
+                    if request.get("session_id") != session.get("session_id"):
+                        raise RuntimeError(
+                            f"Remote weight sync session mismatch: got {request.get('session_id')!r}, "
+                            f"expected {session.get('session_id')!r}."
+                        )
+                    timeout_sec = request.get("timeout_sec")
+                    if timeout_sec is None:
+                        timeout_sec = min(server.state.ipc_timeout_sec, 30.0)
+                    timeout_sec = max(0.0, min(float(timeout_sec), server.state.ipc_timeout_sec))
+                    thread = session["thread"]
+                    thread.join(timeout=timeout_sec)
+                    if thread.is_alive():
+                        raise TimeoutError(
+                            "Student vLLM remote IPC receiver is still active after abort "
+                            f"timeout={timeout_sec}s. Restart the student server before continuing."
+                        )
+                    result_box = dict(session["result_box"])
+                    server.state.active_sync_session = None
+                    summary = {
+                        "path": f"{session['owner_name']}.apply_model_remote_ipc",
+                        "receiver_result": result_box.get("result"),
+                        "receiver_ok": result_box.get("ok"),
+                        "receiver_error": result_box.get("error"),
+                        "reason": request.get("reason"),
+                        "wait_sec": time.time() - session["started_at"],
+                    }
+                    gc.collect()
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                    send_message(
+                        self.request,
+                        {
+                            "ok": True,
+                            "message": "remote weight sync session aborted",
+                            "weight_version": server.state.weight_version,
+                            "summary": summary,
                         },
                     )
                     return
