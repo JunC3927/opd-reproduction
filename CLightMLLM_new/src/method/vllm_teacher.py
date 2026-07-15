@@ -219,12 +219,14 @@ class VLLMTeacherScorer:
             if previous_device is not None:
                 torch.cuda.set_device(previous_device)
 
-        self.sampling_params = SamplingParams(
-            max_tokens=1,
-            temperature=1.0,
-            prompt_logprobs=topk,
-        )
         self._sampling_params_keys = self._accepted_sampling_params_keys(SamplingParams)
+        self.sampling_params = self._make_sampling_params(
+            {
+                "max_tokens": 1,
+                "temperature": 1.0,
+                "prompt_logprobs": topk,
+            }
+        )
 
     @staticmethod
     def _filter_llm_kwargs(llm_cls: Any, kwargs: dict[str, Any]) -> dict[str, Any]:
@@ -264,6 +266,12 @@ class VLLMTeacherScorer:
             return None
         return {key for key in parameters if key != "self"}
 
+    def _make_sampling_params(self, params: dict[str, Any]):
+        params.setdefault("detokenize", False)
+        if self._sampling_params_keys is not None:
+            params = {key: value for key, value in params.items() if key in self._sampling_params_keys}
+        return self._sampling_params_cls(**params)
+
     def _sampling_params_from_request(self, request: dict[str, Any]):
         params = {
             "max_tokens": 1,
@@ -274,9 +282,7 @@ class VLLMTeacherScorer:
         if isinstance(request_params, dict):
             params.update({key: value for key, value in request_params.items() if value is not None})
         params.setdefault("prompt_logprobs", self.topk)
-        if self._sampling_params_keys is not None:
-            params = {key: value for key, value in params.items() if key in self._sampling_params_keys}
-        return self._sampling_params_cls(**params)
+        return self._make_sampling_params(params)
 
     @staticmethod
     def _dedup_consecutive_mm_tokens(
