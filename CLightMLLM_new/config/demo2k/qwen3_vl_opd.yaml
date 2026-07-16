@@ -36,11 +36,8 @@ method:
     opd_loss_type: forward_kl_topk
     opd_topk: 32
 
-    # 对齐 verl: 纯 OPD，不加 SFT loss
-    opd_sft_coef: 0.0
 
     # 对齐 verl rollout
-    rollout_num_generations: 1
     rollout_do_sample: true
     rollout_temperature: 1.0
     rollout_top_p: 1.0

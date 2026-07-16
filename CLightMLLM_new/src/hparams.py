@@ -94,7 +94,6 @@ class MethodArguments:
     opd_alpha: float = 1.0
     opd_temperature: float = 1.0
     opd_loss_type: Literal["kl", "direct","forward_kl_topk"] = "kl"
-    opd_sft_coef: float = 0.0
     opd_topk: int = 32
     opd_topk_renorm :bool = True
     opd_log_prob_min_clamp: float | None = -10.0
@@ -133,8 +132,6 @@ class MethodArguments:
             raise ValueError("method.opd_alpha must be non-negative.")
         if self.opd_temperature <= 0:
             raise ValueError("method.opd_temperature must be positive.")
-        if self.opd_sft_coef < 0:
-            raise ValueError("method.opd_sft_coef must be non-negative.")
         if self.opd_topk <= 0:
             raise ValueError("method.opd_topk must be positive.")
         if self.opd_loss_max_clamp is not None and self.opd_loss_max_clamp <= 0:

@@ -44,7 +44,6 @@ method:
     opd_alpha: 1.0
     opd_temperature: 1.0
     opd_loss_type: forward_kl_topk
-    opd_sft_coef: 0.0
     opd_topk: 32
     opd_log_prob_min_clamp: -10.0
     opd_loss_max_clamp: 10.0
@@ -60,7 +59,6 @@ method:
     rollout_student_server_sync_dtype: none
     rollout_student_server_summon_rank0_only: true
     rollout_student_server_summon_offload_to_cpu: false
-    rollout_num_generations: 1
     rollout_do_sample: true
     rollout_temperature: 1.0
     rollout_top_p: 1.0

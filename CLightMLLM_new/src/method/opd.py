@@ -266,75 +266,48 @@ class OPDLearner(RolloutMixin, BaseLearner):
             )
 
         prompt_width = self.prompt_width(batch)
-        rollout_losses = []
-        distill_losses = []
-        sft_losses = []
-        teacher_masses = []
-        student_masses = []
-        overlap_ratios = []
-        response_token_counts = []
 
-        for _ in range(self.method_args.rollout_num_generations):
-            sequences = self.generate_rollout(batch)
-            completion_mask = self.completion_mask(sequences, prompt_width)
-            attention_mask = self.sequence_attention_mask(batch, sequences, completion_mask)
-            response_mask = self.shift_completion_mask(
-                token_values=sequences[:, 1:],
-                completion_mask=completion_mask,
-                prompt_width=prompt_width,
-            )
+        sequences = self.generate_rollout(batch)
+        completion_mask = self.completion_mask(sequences, prompt_width)
+        attention_mask = self.sequence_attention_mask(batch, sequences, completion_mask)
+        response_mask = self.shift_completion_mask(
+            token_values=sequences[:, 1:],
+            completion_mask=completion_mask,
+            prompt_width=prompt_width,
+        )
 
-            if response_mask.sum() == 0:
-                continue
-            response_mask = response_mask.to(dtype=torch.float32)
-            response_token_counts.append(response_mask.sum().detach())
+        if response_mask.sum() == 0:
+            return self.model(**self.model_kwargs(batch)).loss * 0.0
+        response_mask = response_mask.to(dtype=torch.float32)
 
-            with torch.no_grad():
-                teacher_topk_logps, teacher_topk_ids = self.compute_teacher_topk(
-                    batch=batch,
-                    sequences=sequences,
-                    attention_mask=attention_mask,
-                    response_mask=response_mask,
-                )
-
-            student_outputs = self.model(**self.sequence_model_kwargs(batch, sequences, attention_mask))
-            student_logits = student_outputs.logits[:, :-1].float() / self.method_args.opd_temperature
-            loss_outputs = self.compute_forward_kl_topk_loss(
-                student_logits=student_logits,
-                teacher_topk_logps=teacher_topk_logps,
-                teacher_topk_ids=teacher_topk_ids,
+        with torch.no_grad():
+            teacher_topk_logps, teacher_topk_ids = self.compute_teacher_topk(
+                batch=batch,
+                sequences=sequences,
+                attention_mask=attention_mask,
                 response_mask=response_mask,
             )
-            distill_loss = loss_outputs["loss"] * (self.method_args.opd_temperature**2)
-            total_loss = self.method_args.opd_alpha * distill_loss
 
-            if self.method_args.opd_sft_coef > 0:
-                sft_loss = self.model(**self.model_kwargs(batch)).loss
-                sft_losses.append(sft_loss.detach())
-                total_loss = total_loss + self.method_args.opd_sft_coef * sft_loss
+        student_outputs = self.model(**self.sequence_model_kwargs(batch, sequences, attention_mask))
+        student_logits = student_outputs.logits[:, :-1].float() / self.method_args.opd_temperature
+        loss_outputs = self.compute_forward_kl_topk_loss(
+            student_logits=student_logits,
+            teacher_topk_logps=teacher_topk_logps,
+            teacher_topk_ids=teacher_topk_ids,
+            response_mask=response_mask,
+        )
+        distill_loss = loss_outputs["loss"] * (self.method_args.opd_temperature**2)
+        loss = self.method_args.opd_alpha * distill_loss
 
-            rollout_losses.append(total_loss)
-            distill_losses.append(distill_loss.detach())
-            teacher_masses.append(self.masked_mean(loss_outputs["teacher_mass"].detach(), response_mask))
-            student_masses.append(self.masked_mean(loss_outputs["student_mass"].detach(), response_mask))
-            overlap_ratios.append(
-                self.masked_mean(
-                    loss_outputs["overlap_count"].detach().float() / self.method_args.opd_topk,
-                    response_mask,
-                )
-            )
-
-        if not rollout_losses:
-            return self.model(**self.model_kwargs(batch)).loss * 0.0
-
-        loss = torch.stack(rollout_losses).mean()
-        self.log_metric("train/opd_loss", torch.stack(distill_losses).mean(), batch, prog_bar=True)
-        self.log_metric("train/teacher_mass", torch.stack(teacher_masses).mean(), batch)
-        self.log_metric("train/student_mass", torch.stack(student_masses).mean(), batch)
-        self.log_metric("train/topk_overlap_ratio", torch.stack(overlap_ratios).mean(), batch)
-        self.log_metric("train/response_tokens_per_rank", torch.stack(response_token_counts).mean(), batch)
-        if sft_losses:
-            self.log_metric("train/sft_loss", torch.stack(sft_losses).mean(), batch)
+        self.log_metric("train/opd_loss", distill_loss.detach(), batch, prog_bar=True)
+        self.log_metric("train/teacher_mass", self.masked_mean(loss_outputs["teacher_mass"].detach(), response_mask), batch)
+        self.log_metric("train/student_mass", self.masked_mean(loss_outputs["student_mass"].detach(), response_mask), batch)
+        self.log_metric(
+            "train/topk_overlap_ratio",
+            self.masked_mean(loss_outputs["overlap_count"].detach().float() / self.method_args.opd_topk, response_mask),
+            batch,
+        )
+        self.log_metric("train/response_tokens_per_rank", response_mask.sum().detach(), batch)
         return loss
 
     def compute_teacher_topk(
