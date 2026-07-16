@@ -103,11 +103,8 @@ class OPDLearner(RolloutMixin, BaseLearner):
         current_step = int(getattr(self.trainer, "global_step", 0))
         if current_step <= self._last_student_rollout_sync_step:
             return
-        if isinstance(self.student_rollout, RemoteStudentRollout):
-            self._sync_remote_student_rollout()
-            self._last_student_rollout_sync_step = current_step
-            return
-        raise RuntimeError("Student vLLM weight sync requires rollout_backend='vllm_student_server'.")
+        self._sync_remote_student_rollout()
+        self._last_student_rollout_sync_step = current_step
 
     def _sync_remote_student_rollout(self) -> None:
         if self.method_args.rollout_student_server_sync_backend != "remote_ipc_summon":
@@ -126,7 +123,6 @@ class OPDLearner(RolloutMixin, BaseLearner):
             )
 
         rank = self._dist_rank()
-        local_rank = int(os.environ.get("LOCAL_RANK", "0"))
         sync_dtype = self._remote_sync_dtype()
 
         with self._summon_full_params_compat(
@@ -149,8 +145,8 @@ class OPDLearner(RolloutMixin, BaseLearner):
                     if weights is not None:
                         weights.clear()
                     gc.collect()
-            self._dist_barrier("inside-remote-student-sync", local_rank=local_rank)
-        self._dist_barrier("post-remote-student-sync", local_rank=local_rank)
+            self._dist_barrier()
+        self._dist_barrier()
 
     def _student_model_weight_items(self) -> list[tuple[str, torch.Tensor]]:
         weights: list[tuple[str, torch.Tensor]] = []
@@ -234,7 +230,7 @@ class OPDLearner(RolloutMixin, BaseLearner):
         return int(os.environ.get("RANK", os.environ.get("LOCAL_RANK", "0")))
 
     @staticmethod
-    def _dist_barrier(label: str, *, local_rank: int) -> None:
+    def _dist_barrier() -> None:
         if not (dist.is_available() and dist.is_initialized()):
             return
         if str(dist.get_backend()).lower() == "nccl" and torch.cuda.is_available():

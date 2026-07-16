@@ -149,44 +149,24 @@ def _estimated_ipc_nbytes(tensor: torch.Tensor, sync_dtype: torch.dtype | None) 
     return int(tensor.numel()) * int(itemsize)
 
 
-def describe_weight_items_for_ipc(weights: Any, *, sync_dtype: torch.dtype | None) -> dict[str, Any]:
+def _largest_weight_item_for_ipc(weights: Any, *, sync_dtype: torch.dtype | None) -> dict[str, Any] | None:
     if not isinstance(weights, (list, tuple)):
-        return {
-            "weight_count": None,
-            "total_nbytes": None,
-            "largest_name": None,
-            "largest_nbytes": None,
-            "largest_shape": None,
-            "largest_dtype": None,
-        }
-    total_nbytes = 0
+        return None
     largest: tuple[str, torch.Tensor, int] | None = None
-    count = 0
     for name, tensor in weights:
         if not torch.is_tensor(tensor):
             continue
-        count += 1
         nbytes = _estimated_ipc_nbytes(tensor, sync_dtype)
-        total_nbytes += nbytes
         if largest is None or nbytes > largest[2]:
             largest = (name, tensor, nbytes)
     if largest is None:
-        return {
-            "weight_count": count,
-            "total_nbytes": total_nbytes,
-            "largest_name": None,
-            "largest_nbytes": None,
-            "largest_shape": None,
-            "largest_dtype": None,
-        }
+        return None
     largest_name, largest_tensor, largest_nbytes = largest
     return {
-        "weight_count": count,
-        "total_nbytes": total_nbytes,
-        "largest_name": largest_name,
-        "largest_nbytes": largest_nbytes,
-        "largest_shape": tuple(int(dim) for dim in largest_tensor.shape),
-        "largest_dtype": str(largest_tensor.dtype),
+        "name": largest_name,
+        "nbytes": largest_nbytes,
+        "shape": tuple(int(dim) for dim in largest_tensor.shape),
+        "dtype": str(largest_tensor.dtype),
     }
 
 
@@ -212,16 +192,15 @@ def send_weight_items_ipc(
             torch.cuda.set_device(target_device.index)
 
     counter = {"count": 0}
-    weight_stats = describe_weight_items_for_ipc(weights, sync_dtype=sync_dtype)
+    largest_weight = _largest_weight_item_for_ipc(weights, sync_dtype=sync_dtype) if use_shm else None
     bucket_nbytes = int(bucket_size_mb) << 20
-    largest_nbytes = weight_stats.get("largest_nbytes")
-    if use_shm and largest_nbytes is not None and int(largest_nbytes) > bucket_nbytes:
-        largest_mb = int(largest_nbytes) / 1024**2
+    if largest_weight is not None and int(largest_weight["nbytes"]) > bucket_nbytes:
+        largest_mb = int(largest_weight["nbytes"]) / 1024**2
         raise ValueError(
             "SHM bucket is smaller than the largest tensor after sync dtype conversion: "
-            f"largest={weight_stats.get('largest_name')} "
-            f"shape={weight_stats.get('largest_shape')} "
-            f"dtype={weight_stats.get('largest_dtype')} "
+            f"largest={largest_weight['name']} "
+            f"shape={largest_weight['shape']} "
+            f"dtype={largest_weight['dtype']} "
             f"estimated={largest_mb:.1f}MiB, bucket_size_mb={bucket_size_mb}. "
             "Increase --ipc-bucket-size-mb or use CUDA IPC."
         )
@@ -255,7 +234,6 @@ def send_weight_items_ipc(
         "bucket_size_mb": int(bucket_size_mb),
         "use_shm": bool(use_shm),
         "zmq_handle": zmq_handle,
-        "weight_stats": weight_stats,
     }
 
 

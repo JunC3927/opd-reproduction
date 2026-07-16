@@ -30,7 +30,7 @@ if str(ROOT) not in sys.path:
 from src.method.rpc import recv_message, send_message  # noqa: E402
 from src.method.vllm_student import VLLMStudentRollout  # noqa: E402
 from src.model import load_processor_and_tokenizer  # noqa: E402
-from src.hparams import ModelArguments, parse_torch_dtype  # noqa: E402
+from src.hparams import ModelArguments  # noqa: E402
 
 
 TORCHRUN_ENV_KEYS = {
@@ -60,16 +60,12 @@ class StudentState:
         self,
         rollout: VLLMStudentRollout,
         *,
-        bucket_size_mb: int,
         use_shm: bool,
         ipc_timeout_sec: float,
-        sync_dtype: torch.dtype | None,
     ) -> None:
         self.rollout = rollout
-        self.bucket_size_mb = int(bucket_size_mb)
         self.use_shm = bool(use_shm)
         self.ipc_timeout_sec = float(ipc_timeout_sec)
-        self.sync_dtype = sync_dtype
         self.weight_version = 0
         self.lock = threading.Lock()
         self.active_sync_session: dict[str, Any] | None = None
@@ -333,8 +329,6 @@ def main() -> None:
         f"enable_prefix_caching={args.enable_prefix_caching}",
         f"image_min_pixels={args.image_min_pixels}",
         f"image_max_pixels={args.image_max_pixels}",
-        f"ipc_bucket_size_mb={args.ipc_bucket_size_mb}",
-        f"sync_dtype={args.sync_dtype}",
         f"CUDA_VISIBLE_DEVICES={os.environ.get('CUDA_VISIBLE_DEVICES')}",
         flush=True,
     )
@@ -346,7 +340,6 @@ def main() -> None:
         image_max_pixels=args.image_max_pixels,
     )
     _processor, tokenizer, _common_kwargs = load_processor_and_tokenizer(processor_args)
-    sync_dtype = None if args.sync_dtype.lower() == "none" else parse_torch_dtype(args.sync_dtype)
     limit_mm_per_prompt = None
     if args.limit_images is not None:
         limit_mm_per_prompt = {"image": int(args.limit_images), "video": 0}
@@ -377,10 +370,8 @@ def main() -> None:
 
     state = StudentState(
         rollout,
-        bucket_size_mb=args.ipc_bucket_size_mb,
         use_shm=args.ipc_use_shm,
         ipc_timeout_sec=args.ipc_timeout_sec,
-        sync_dtype=sync_dtype,
     )
     with StudentTCPServer((args.host, args.port), StudentHandler, state) as server:
         print(f"CLight shared vLLM student listening on {args.host}:{args.port}", flush=True)

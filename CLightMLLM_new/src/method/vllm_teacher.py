@@ -7,10 +7,6 @@ import torch
 from .rpc import rpc_call
 
 
-def is_rank_zero_process() -> bool:
-    return int(os.environ.get("RANK", os.environ.get("LOCAL_RANK", "0"))) == 0
-
-
 def resolve_cuda_device(device: str | None) -> str | None:
     if device is None:
         return None
@@ -161,18 +157,7 @@ class VLLMTeacherScorer:
             previous_device = torch.cuda.current_device()
             index = torch.device(device).index
             if index is not None:
-                if os.getenv("CLIGHT_OPD_VLLM_DEBUG") == "1" and is_rank_zero_process():
-                    print(f"OPD vLLM set_device(cuda:{index})")
                 torch.cuda.set_device(index)
-                if os.getenv("CLIGHT_OPD_VLLM_DEBUG") == "1" and is_rank_zero_process():
-                    free, total = torch.cuda.mem_get_info(index)
-                    print(
-                        "OPD teacher vLLM memory before init:",
-                        f"cuda:{index}",
-                        f"free={free / 1024**3:.2f}GiB",
-                        f"total={total / 1024**3:.2f}GiB",
-                        f"gpu_memory_utilization={gpu_memory_utilization}",
-                    )
 
         llm_kwargs: dict[str, Any] = {
             "model": model_path,
@@ -241,9 +226,6 @@ class VLLMTeacherScorer:
             return kwargs
 
         filtered = {key: value for key, value in kwargs.items() if key in parameters}
-        skipped = sorted(set(kwargs) - set(filtered))
-        if skipped and os.getenv("CLIGHT_OPD_VLLM_DEBUG") == "1" and is_rank_zero_process():
-            print(f"OPD teacher vLLM skipped unsupported LLM kwargs: {skipped}")
         return filtered
 
     @staticmethod
@@ -569,17 +551,6 @@ class VLLMTeacherScorer:
             output_len = len(prompt_logprobs) - 1
             expanded_len = max(active_len - 1, 0)
             dedup_len = max(len(kept_indices) - 1, 0)
-            if os.getenv("CLIGHT_OPD_VLLM_DEBUG") == "1" and is_rank_zero_process():
-                print(
-                    "OPD vLLM lengths:",
-                    f"row={row_idx}",
-                    f"start={start}",
-                    f"active_len={active_len}",
-                    f"kept_len={len(kept_indices)}",
-                    f"output_len={output_len}",
-                    f"expanded_shift_len={expanded_len}",
-                    f"dedup_shift_len={dedup_len}",
-                )
             logps, ids = self._extract_topk(output, expected_len=output_len)
 
             if response_shift_indices is not None:
@@ -591,15 +562,6 @@ class VLLMTeacherScorer:
                         "Unexpected vLLM prompt_logprobs length for response alignment: "
                         f"got {output_len}, need at least response tokens {response_len} "
                         f"(row={row_idx}, active_len={active_len}, kept_len={len(kept_indices)})."
-                    )
-                if os.getenv("CLIGHT_OPD_VLLM_DEBUG") == "1" and is_rank_zero_process():
-                    print(
-                        "OPD vLLM response suffix alignment:",
-                        f"row={row_idx}",
-                        f"output_len={output_len}",
-                        f"response_len={response_len}",
-                        f"first_shift={response_shift_indices[0]}",
-                        f"last_shift={response_shift_indices[-1]}",
                     )
                 response_logps = logps[-response_len:].to(device)
                 response_ids = ids[-response_len:].to(device)
