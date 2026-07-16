@@ -11,12 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Bucketed tensor transfer for student vLLM weight sync.
-
-This is the small subset of VERL's bucketed weight transfer that the OPD
-student server uses. Keeping it local makes the Lightning OPD path independent
-from an external ``verl_new`` checkout.
-"""
+"""Bucketed tensor transfer for student vLLM weight sync."""
 
 from __future__ import annotations
 

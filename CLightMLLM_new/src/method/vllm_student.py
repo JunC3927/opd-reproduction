@@ -168,7 +168,7 @@ def send_weight_items_ipc(
     device: torch.device | str | None = None,
     sync_dtype: torch.dtype | None = None,
 ) -> dict[str, Any]:
-    """Send weight tensors to a waiting vLLM receiver over VERL bucketed IPC.
+    """Send weight tensors to a waiting vLLM receiver over bucketed IPC.
 
     The weights are moved/cast lazily so the sender does not materialize the
     full bf16 model on one GPU before transfer.
