@@ -33,7 +33,6 @@ method:
     # 对齐 verl: forward_kl_topk, topk=32
     opd_alpha: 1.0
     opd_temperature: 1.0
-    opd_loss_type: forward_kl_topk
     opd_topk: 32
 
 

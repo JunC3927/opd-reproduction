@@ -260,10 +260,6 @@ class OPDLearner(RolloutMixin, BaseLearner):
     def compute_loss(self, batch: dict[str, Any]) -> torch.Tensor:
         if self.teacher_model is None and self.teacher_scorer is None:
             raise ValueError("OPD requires an HF teacher_model or method.opd_teacher_backend='vllm_server'.")
-        if self.method_args.opd_loss_type != "forward_kl_topk":
-            raise NotImplementedError(
-                "This OPD learner currently implements method.opd_loss_type='forward_kl_topk' only."
-            )
 
         prompt_width = self.prompt_width(batch)
 

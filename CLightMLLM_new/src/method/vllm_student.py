@@ -1,21 +1,14 @@
 import os
 import asyncio
 import functools
-import sys
 import threading
 import time
-from pathlib import Path
 from typing import Any
 
 import torch
 
+from .bucketed_weight_transfer import BucketedWeightReceiver, BucketedWeightSender
 from .rpc import rpc_call
-
-ROOT = Path(__file__).resolve().parents[2]
-REPO_ROOT = ROOT.parent
-VERL_ROOT = REPO_ROOT / "verl_new"
-if str(VERL_ROOT) not in sys.path:
-    sys.path.insert(0, str(VERL_ROOT))
 
 
 def resolve_cuda_device(device: str | None) -> str | None:
@@ -67,8 +60,6 @@ def _infer_model_device(model: torch.nn.Module) -> torch.device:
 
 
 def _ipc_load_weights_on_worker(model: Any, zmq_handle: str, use_shm: bool) -> str:
-    from verl.workers.rollout.vllm_rollout.bucketed_weight_transfer import BucketedWeightReceiver
-
     device = _infer_model_device(model)
     bucket_summaries: list[dict[str, Any]] = []
     receiver = BucketedWeightReceiver(
@@ -110,8 +101,6 @@ def _send_weights_via_ipc(
     bucket_size_mb: int,
     use_shm: bool,
 ) -> None:
-    from verl.workers.rollout.vllm_rollout.bucketed_weight_transfer import BucketedWeightSender
-
     sender = BucketedWeightSender(
         zmq_handle=zmq_handle,
         bucket_size_mb=bucket_size_mb,
@@ -248,11 +237,6 @@ class RemoteStudentRollout:
         self.host = host
         self.port = int(port)
         self.timeout = float(timeout)
-        self._rank = int(os.environ.get("RANK", os.environ.get("LOCAL_RANK", "0")))
-
-    def ping(self) -> dict[str, Any]:
-        response = rpc_call(self.host, self.port, {"op": "ping"}, self.timeout)
-        return self._checked_response(response)
 
     @torch.no_grad()
     def generate(
@@ -362,9 +346,6 @@ class RemoteStudentRollout:
                 self.timeout,
             )
         )
-
-    def shutdown(self) -> dict[str, Any]:
-        return self._checked_response(rpc_call(self.host, self.port, {"op": "shutdown"}, self.timeout))
 
     @staticmethod
     def _checked_response(response: Any) -> dict[str, Any]:

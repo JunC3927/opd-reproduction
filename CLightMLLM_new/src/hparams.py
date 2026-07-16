@@ -93,9 +93,7 @@ class MethodArguments:
     opd_teacher_server_timeout: float = 600.0
     opd_alpha: float = 1.0
     opd_temperature: float = 1.0
-    opd_loss_type: Literal["kl", "direct","forward_kl_topk"] = "kl"
     opd_topk: int = 32
-    opd_topk_renorm :bool = True
     opd_log_prob_min_clamp: float | None = -10.0
     opd_loss_max_clamp: float | None = 10.0
 

@@ -210,8 +210,7 @@ class RolloutMixin:
                 pad_token_id=self.tokenizer.pad_token_id,
             )
             if isinstance(rollout_result, tuple):
-                sequences, weight_version = rollout_result
-                setattr(self, "_last_student_rollout_weight_version", int(weight_version))
+                sequences, _weight_version = rollout_result
                 return sequences
             return rollout_result
 
