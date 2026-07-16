@@ -42,18 +42,11 @@ class RemoteTeacherScorer:
         image_token_id: int | None,
         video_token_id: int | None,
         pad_token_id: int,
-        model_kwargs: dict[str, Any] | None = None,
         mm_processor_kwargs_per_sample: list[dict[str, Any] | None] | None = None,
         multi_modal_data_per_sample: list[dict[str, Any] | None] | None = None,
         response_mask: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         device = sequences.device
-        cpu_model_kwargs = None
-        if model_kwargs is not None:
-            cpu_model_kwargs = {
-                key: value.detach().cpu() if torch.is_tensor(value) else value
-                for key, value in model_kwargs.items()
-            }
         request = {
             "op": "score",
             "sequences": sequences.detach().cpu(),
@@ -64,7 +57,6 @@ class RemoteTeacherScorer:
             "video_token_id": video_token_id,
             "pad_token_id": int(pad_token_id),
             "topk": self.topk,
-            "model_kwargs": cpu_model_kwargs,
             "mm_processor_kwargs_per_sample": mm_processor_kwargs_per_sample,
             "multi_modal_data_per_sample": multi_modal_data_per_sample,
         }
@@ -457,7 +449,6 @@ class VLLMTeacherScorer:
         image_token_id: int | None,
         video_token_id: int | None,
         pad_token_id: int,
-        model_kwargs: dict[str, Any] | None = None,
         mm_processor_kwargs_per_sample: list[dict[str, Any] | None] | None = None,
         multi_modal_data_per_sample: list[dict[str, Any] | None] | None = None,
         response_mask: torch.Tensor | None = None,

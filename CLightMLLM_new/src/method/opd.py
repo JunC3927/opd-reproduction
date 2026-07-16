@@ -50,7 +50,7 @@ class OPDLearner(RolloutMixin, BaseLearner):
                     timeout=self.method_args.rollout_student_server_timeout,
                 ),
             )
-        if self.method_args.opd_teacher_backend in {"vllm_server", "hf_server"}:
+        if self.method_args.opd_teacher_backend == "vllm_server":
             object.__setattr__(
                 self,
                 "_teacher_scorer",
@@ -259,7 +259,7 @@ class OPDLearner(RolloutMixin, BaseLearner):
 
     def compute_loss(self, batch: dict[str, Any]) -> torch.Tensor:
         if self.teacher_model is None and self.teacher_scorer is None:
-            raise ValueError("OPD requires an HF teacher_model or method.opd_teacher_backend='vllm_server'/'hf_server'.")
+            raise ValueError("OPD requires an HF teacher_model or method.opd_teacher_backend='vllm_server'.")
         if self.method_args.opd_loss_type != "forward_kl_topk":
             raise NotImplementedError(
                 "This OPD learner currently implements method.opd_loss_type='forward_kl_topk' only."
@@ -347,17 +347,13 @@ class OPDLearner(RolloutMixin, BaseLearner):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         if self.teacher_scorer is not None:
             config = getattr(self.model, "config", None)
-            model_kwargs = None
-            if self.method_args.opd_teacher_backend == "hf_server":
-                model_kwargs = self.sequence_model_kwargs(batch, sequences, attention_mask)
             return self.teacher_scorer.score(
                 sequences=sequences,
                 attention_mask=attention_mask,
-                images_per_sample=None if self.method_args.opd_teacher_backend == "hf_server" else batch.get("vllm_images"),
+                images_per_sample=batch.get("vllm_images"),
                 image_token_id=getattr(config, "image_token_id", None),
                 video_token_id=getattr(config, "video_token_id", None),
                 pad_token_id=self.tokenizer.pad_token_id,
-                model_kwargs=model_kwargs,
                 mm_processor_kwargs_per_sample=batch.get("mm_processor_kwargs"),
                 multi_modal_data_per_sample=batch.get("multi_modal_data"),
                 response_mask=response_mask,

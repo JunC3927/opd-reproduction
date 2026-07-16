@@ -85,7 +85,7 @@ class MethodArguments:
     grpo_kl_coef: float = 0.0
     grpo_reference_model: bool = False
     opd_teacher_model_name_or_path: str | None = None
-    opd_teacher_backend: Literal["hf", "vllm_server", "hf_server"] = "hf"
+    opd_teacher_backend: Literal["hf", "vllm_server"] = "hf"
     opd_teacher_device: str | None = None
     opd_teacher_torch_dtype: str | None = None
     opd_teacher_server_host: str = "127.0.0.1"
